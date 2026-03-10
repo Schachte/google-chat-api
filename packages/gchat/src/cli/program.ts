@@ -12,26 +12,12 @@ import { parseTimeToUsec } from '../utils/time.js';
 import { startApiServer } from '../server/api-server.js';
 import {
   getCookies,
-  invalidateCache,
   invalidateCookieCache,
-  invalidateAuthCache,
-  loadAuthCache,
-  authenticateWithCookies,
-  injectCookiesToBrowser,
-  listProfiles,
-  setProfile,
-  getProfile,
-  listBrowsers,
   listBrowsersWithProfiles,
+  setProfile,
   setBrowser,
-  getBrowser,
-  setCustomCookiePath,
   setDebugMode,
-  buildCookieString,
-  type Cookies,
-  type AuthCache,
   type BrowserType,
-  type BrowserInfo,
 } from '../core/auth.js';
 import { log, setLogLevel, setLogColors, type LogLevel } from '../core/logger.js';
 import type { Message, Space, Topic, WorldItemSummary, UserPresence, UserPresenceWithProfile, ImageMetadata, AttachmentMetadata, UrlMetadata } from '../core/types.js';
@@ -207,7 +193,7 @@ async function confirmAction(message: string): Promise<boolean> {
 }
 
 async function cmdSpaces(options: { refresh?: boolean; json?: boolean; profile?: string }): Promise<void> {
-  const client = await createClient(options);
+  const client = await createClient();
   const spaces = await client.listSpaces();
 
   if (options.json) {
@@ -234,507 +220,6 @@ async function cmdSpaces(options: { refresh?: boolean; json?: boolean; profile?:
   }
 }
 
-async function cmdAuth(options: { profile?: string; cacheDir?: string }): Promise<void> {
-  log.auth.info('Authenticating with Google Chat...');
-
-  if (options.profile) {
-    setProfile(options.profile);
-    printInfo(`Using Chrome profile: ${options.profile}`);
-  }
-
-  const cacheDir = resolveCacheDir(options);
-  try {
-    const cookies = getCookies();
-    const authResult = await authenticateWithCookies({ cookies, forceRefresh: false, cacheDir });
-
-    const authCache = loadAuthCache(cacheDir);
-    if (authCache) {
-      const ageMinutes = Math.floor((Date.now() - authCache.cached_at) / 60000);
-      printSuccess(`Authentication successful (cache age: ${ageMinutes} minutes)`);
-    } else {
-      printSuccess('Authentication successful (fresh)');
-    }
-
-    printInfo(`XSRF Token: ${authResult.xsrfToken.slice(0, 20)}...`);
-    printInfo(`Cookies: ${Object.keys(authResult.cookies).join(', ')}`);
-  } catch (e) {
-    printError(`Authentication failed: ${(e as Error).message}`);
-    process.exit(1);
-  }
-}
-
-async function cmdAuthForceRefresh(options: { profile?: string; cacheDir?: string }): Promise<void> {
-  log.auth.info('Force refreshing authentication...');
-
-  if (options.profile) {
-    setProfile(options.profile);
-    printInfo(`Using Chrome profile: ${options.profile}`);
-  }
-
-  const cacheDir = resolveCacheDir(options);
-  try {
-    invalidateCache(cacheDir);
-    printInfo('Cache invalidated');
-
-    const cookies = getCookies();
-    const authResult = await authenticateWithCookies({ cookies, forceRefresh: true, cacheDir });
-
-    printSuccess('Authentication refreshed successfully');
-    printInfo(`XSRF Token: ${authResult.xsrfToken.slice(0, 20)}...`);
-    printInfo(`Cookies: ${Object.keys(authResult.cookies).join(', ')}`);
-  } catch (e) {
-    printError(`Force refresh failed: ${(e as Error).message}`);
-    process.exit(1);
-  }
-}
-
-async function cmdAuthCheckExpires(options: { cacheDir?: string } = {}): Promise<void> {
-  printHeader('Authentication Expiration Status');
-
-  const cacheDir = resolveCacheDir(options);
-  const authCache = loadAuthCache(cacheDir);
-
-  if (!authCache) {
-    printWarning('No cached authentication found');
-    printInfo('Run "gchat auth" to authenticate');
-    return;
-  }
-
-  const now = Date.now();
-  const cachedAt = authCache.cached_at;
-  const ageMs = now - cachedAt;
-  const ageHours = ageMs / 3600000;
-  const ageMinutes = ageMs / 60000;
-
-  const expiresInHours = 24 - ageHours;
-  const expiresInMinutes = (24 * 60) - ageMinutes;
-
-  console.log('');
-  console.log(`  ${c('bold', 'XSRF Token Status:')}`);
-  console.log(`    Cached at: ${c('cyan', new Date(cachedAt).toISOString())}`);
-
-  if (ageHours < 1) {
-    console.log(`    Age: ${c('green', `${Math.floor(ageMinutes)} minutes`)}`);
-  } else {
-    console.log(`    Age: ${c('green', `${ageHours.toFixed(1)} hours`)}`);
-  }
-
-  if (expiresInHours > 1) {
-    console.log(`    Expires in: ${c('green', `${expiresInHours.toFixed(1)} hours`)}`);
-    console.log(`    Status: ${c('green', 'VALID')}`);
-  } else if (expiresInMinutes > 0) {
-    console.log(`    Expires in: ${c('yellow', `${Math.floor(expiresInMinutes)} minutes`)}`);
-    console.log(`    Status: ${c('yellow', 'EXPIRING SOON')}`);
-  } else {
-    console.log(`    Expires in: ${c('red', 'EXPIRED')}`);
-    console.log(`    Status: ${c('red', 'EXPIRED')}`);
-  }
-
-  console.log('');
-  console.log(`  ${c('bold', 'Chrome Cookies:')}`);
-  console.log(`    ${c('dim', 'Cookies are extracted from Chrome browser')}`);
-  console.log(`    ${c('dim', 'Expiration: Typically 1-2 years (managed by Chrome)')}`);
-  console.log(`    ${c('dim', 'Valid as long as you are logged into Google in Chrome')}`);
-  console.log('');
-
-  if (expiresInHours < 1) {
-    printWarning('XSRF token will expire soon. Run "gchat auth-force-refresh" to refresh.');
-  }
-}
-
-function cmdAuthRemoveCache(options: { cacheDir?: string } = {}): void {
-  printInfo('Removing authentication cache...');
-
-  const cacheDir = resolveCacheDir(options);
-  invalidateCache(cacheDir);
-
-  printSuccess('Authentication cache removed');
-  printInfo('Cached cookies: cleared');
-  printInfo('Cached XSRF token: cleared');
-  printInfo('');
-  printInfo('Run "gchat auth" to re-authenticate');
-}
-
-async function cmdAuthWatch(options: { profile?: string; interval?: string; cacheDir?: string }): Promise<void> {
-  const intervalMinutes = options.interval ? parseInt(options.interval, 10) : 5;
-  const intervalMs = intervalMinutes * 60 * 1000;
-
-  if (options.profile) {
-    setProfile(options.profile);
-    printInfo(`Using Chrome profile: ${options.profile}`);
-  }
-
-  printHeader('Authentication Watch Mode');
-  printInfo(`Refreshing authentication every ${intervalMinutes} minutes`);
-  printInfo('Press Ctrl+C to stop');
-  console.log('');
-
-  let refreshCount = 0;
-
-  const performRefresh = async () => {
-    refreshCount++;
-    const timestamp = new Date().toISOString();
-    const cacheDir = resolveCacheDir(options);
-
-    try {
-      log.auth.info(`[Refresh #${refreshCount}] Starting authentication refresh...`);
-
-      invalidateCache(cacheDir);
-
-      const cookies = getCookies();
-
-      const authResult = await authenticateWithCookies({
-        cookies,
-        forceRefresh: true,
-        cacheDir
-      });
-
-      printSuccess(`[${timestamp}] Refresh #${refreshCount} successful`);
-      printInfo(`  XSRF Token: ${authResult.xsrfToken.slice(0, 20)}...`);
-      printInfo(`  Cookies extracted: ${Object.keys(authResult.cookies).length}`);
-
-      log.auth.info(`[Refresh #${refreshCount}] Authentication refreshed successfully`);
-    } catch (e) {
-      printError(`[${timestamp}] Refresh #${refreshCount} failed: ${(e as Error).message}`);
-      log.auth.error(`[Refresh #${refreshCount}] Authentication refresh failed:`, e);
-    }
-
-    console.log('');
-  };
-
-  await performRefresh();
-
-  const intervalId = setInterval(async () => {
-    await performRefresh();
-  }, intervalMs);
-
-  const shutdown = () => {
-    console.log('');
-    printInfo('Stopping authentication watch...');
-    clearInterval(intervalId);
-    printSuccess(`Completed ${refreshCount} refresh cycles`);
-    process.exit(0);
-  };
-
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
-
-  await new Promise(() => {});
-}
-
-async function cmdAuthInjectCookies(options: {
-  profile?: string;
-  file?: string;
-  domain?: string;
-  expires?: string;
-}): Promise<void> {
-  printHeader('Inject Cookies to Chrome Profile');
-
-  printWarning('SECURITY WARNING:');
-  console.log('  - Only inject cookies you own or have legitimate access to');
-  console.log('  - Chrome must be completely closed before running this');
-  console.log('  - Cookies will be encrypted and written to Chrome database');
-  console.log('');
-
-  const cookiesFile = options.file || 'cookies.txt';
-  const cookiesPath = path.resolve(cookiesFile);
-
-  if (!existsSync(cookiesPath)) {
-    printError(`Cookies file not found: ${cookiesPath}`);
-    printInfo('');
-    printInfo('Create a cookies.txt file with format:');
-    printInfo('  COOKIE_NAME=cookie_value; ANOTHER=value;');
-    printInfo('');
-    printInfo('Or export cookies from current Chrome profile:');
-    printInfo('  gchat auth --json > cookies.json');
-    process.exit(1);
-  }
-
-  try {
-    const cookieContent = readFileSync(cookiesPath, 'utf-8').trim();
-    let cookies: Cookies;
-
-    if (cookieContent.startsWith('{')) {
-      try {
-        const parsed = JSON.parse(cookieContent);
-        if (parsed.cookies && typeof parsed.cookies === 'object') {
-          cookies = parsed.cookies;
-        } else {
-          cookies = parsed;
-        }
-      } catch {
-        printError('Failed to parse cookies.txt as JSON');
-        process.exit(1);
-      }
-    } else {
-      cookies = {};
-      for (const part of cookieContent.split(';')) {
-        const trimmed = part.trim();
-        if (!trimmed) continue;
-
-        const separatorIndex = trimmed.indexOf('=');
-        if (separatorIndex === -1) continue;
-
-        const key = trimmed.slice(0, separatorIndex).trim();
-        const value = trimmed.slice(separatorIndex + 1).trim();
-
-        if (key) {
-          cookies[key] = value;
-        }
-      }
-    }
-
-    if (Object.keys(cookies).length === 0) {
-      printError('No cookies found in file');
-      process.exit(1);
-    }
-
-    printInfo(`Loaded ${Object.keys(cookies).length} cookies from ${cookiesFile}`);
-    printInfo(`Profile: ${options.profile || getProfile() || 'Profile 1'}`);
-    printInfo(`Domain: ${options.domain || '.google.com'}`);
-    printInfo(`Expires in: ${options.expires || '365'} days`);
-    console.log('');
-
-    injectCookiesToBrowser(cookies, {
-      profile: options.profile,
-      domain: options.domain,
-      expiresInDays: options.expires ? parseInt(options.expires, 10) : 365,
-      debug: true,
-    });
-
-    printSuccess('Cookies injected successfully!');
-    printInfo('');
-    printInfo('You can now open Chrome and the cookies should be available.');
-    printInfo('Note: You may need to restart Chrome if it was recently closed.');
-  } catch (e) {
-    printError(`Cookie injection failed: ${(e as Error).message}`);
-    process.exit(1);
-  }
-}
-
-async function cmdAuthInjectCookiesRemote(options: {
-  host: string;
-  profile?: string;
-  file?: string;
-  domain?: string;
-  expires?: string;
-  password?: string;
-  browserPath?: string;
-}): Promise<void> {
-  const { execSync: exec } = await import('node:child_process');
-
-  printHeader(`Inject Cookies to Remote Chromium (${options.host})`);
-
-  printWarning('SECURITY WARNING:');
-  console.log('  - Only inject cookies you own or have legitimate access to');
-  console.log('  - Chromium must be completely closed on remote before running this');
-  console.log('  - Requires SSH access to remote machine');
-  console.log('');
-
-  const cookiesFile = options.file || 'cookies.txt';
-  const cookiesPath = path.resolve(cookiesFile);
-
-  if (!existsSync(cookiesPath)) {
-    printError(`Cookies file not found: ${cookiesPath}`);
-    printInfo('Create cookies.txt or export with: gchat auth --json > cookies.json');
-    process.exit(1);
-  }
-
-  try {
-    printInfo('Loading cookies from local file...');
-    const cookieContent = readFileSync(cookiesPath, 'utf-8').trim();
-    let cookies: Cookies;
-
-    if (cookieContent.startsWith('{')) {
-      const parsed = JSON.parse(cookieContent);
-      cookies = parsed.cookies || parsed;
-    } else {
-      cookies = {};
-      for (const part of cookieContent.split(';')) {
-        const trimmed = part.trim();
-        if (!trimmed) continue;
-        const separatorIndex = trimmed.indexOf('=');
-        if (separatorIndex === -1) continue;
-        const key = trimmed.slice(0, separatorIndex).trim();
-        const value = trimmed.slice(separatorIndex + 1).trim();
-        if (key) cookies[key] = value;
-      }
-    }
-
-    if (Object.keys(cookies).length === 0) {
-      printError('No cookies found in file');
-      process.exit(1);
-    }
-
-    printSuccess(`Loaded ${Object.keys(cookies).length} cookies`);
-    console.log('');
-
-    printInfo('Detecting Chromium on remote...');
-    const browserPath = options.browserPath || '~/snap/chromium/common/chromium/Default/Cookies';
-
-    try {
-      exec(`ssh ${options.host} "test -f ${browserPath}"`, { stdio: 'ignore' });
-      printSuccess(`Found cookie database at: ${browserPath}`);
-    } catch {
-      printError(`Cookie database not found at: ${browserPath}`);
-      printInfo('');
-      printInfo('Common paths:');
-      printInfo('  ~/snap/chromium/common/chromium/Default/Cookies (snap)');
-      printInfo('  ~/.config/chromium/Default/Cookies (apt)');
-      printInfo('  ~/.config/google-chrome/Default/Cookies (chrome)');
-      printInfo('');
-      printInfo('Specify with --browser-path');
-      process.exit(1);
-    }
-
-    printInfo('Checking if Chromium is running...');
-    try {
-      exec(`ssh ${options.host} "pgrep chromium"`, { stdio: 'ignore' });
-      printError('Chromium is running on remote! Please close it first.');
-      process.exit(1);
-    } catch {
-      printSuccess('Chromium is not running (safe to inject)');
-    }
-
-    console.log('');
-
-    printInfo('Generating injection script...');
-
-    const domain = options.domain || '.google.com';
-    const expiresInDays = options.expires ? parseInt(options.expires, 10) : 365;
-    const password = options.password || 'peanuts';
-
-    const injectionScript = `#!/usr/bin/env python3
-import sqlite3
-import hashlib
-import os
-import json
-import time
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
-
-cookies = ${JSON.stringify(cookies)}
-cookie_path = '${browserPath}'.replace('~', os.path.expanduser('~'))
-domain = '${domain}'
-path = '/'
-expires_in_days = ${expiresInDays}
-password = '${password}'
-
-# Derive encryption key (Linux Chromium uses 1 iteration)
-salt = b'saltysalt'
-key = hashlib.pbkdf2_hmac('sha1', password.encode(), salt, 1, 16)
-
-def encrypt_value(value):
-    """Encrypt cookie value using AES-128-CBC"""
-    if not value:
-        return b''
-
-    # Create cipher
-    iv = b' ' * 16  # 16 spaces
-    cipher = Cipher(
-        algorithms.AES(key),
-        modes.CBC(iv),
-        backend=default_backend()
-    )
-    encryptor = cipher.encryptor()
-
-    # Add integrity prefix and pad
-    integrity_prefix = os.urandom(32)
-    data = integrity_prefix + value.encode('utf-8')
-
-    # PKCS7 padding
-    padding_length = 16 - (len(data) % 16)
-    data += bytes([padding_length]) * padding_length
-
-    # Encrypt and add v10 prefix
-    encrypted = encryptor.update(data) + encryptor.finalize()
-    return b'v10' + encrypted
-
-# Calculate expiration timestamp
-expires_date = int((time.time() + expires_in_days * 86400) + 11644473600) * 1000000
-
-# Open database
-conn = sqlite3.connect(cookie_path)
-cursor = conn.cursor()
-
-# Detect schema
-cursor.execute("PRAGMA table_info(cookies)")
-columns = [row[1] for row in cursor.fetchall()]
-is_chromium_schema = 'top_frame_site_key' in columns
-
-print(f"Schema: {'Chromium' if is_chromium_schema else 'Chrome'}")
-
-injected = 0
-updated = 0
-
-for name, value in cookies.items():
-    if not value:
-        continue
-
-    encrypted_value = encrypt_value(value)
-    creation_utc = int(time.time() * 1000000)
-
-    # Check if exists
-    cursor.execute('SELECT rowid FROM cookies WHERE host_key = ? AND name = ? AND path = ?',
-                   (domain, name, path))
-    existing = cursor.fetchone()
-
-    if existing:
-        cursor.execute('''UPDATE cookies
-                         SET encrypted_value = ?, expires_utc = ?, last_access_utc = ?
-                         WHERE rowid = ?''',
-                       (encrypted_value, expires_date, creation_utc, existing[0]))
-        updated += 1
-    else:
-        if is_chromium_schema:
-            cursor.execute('''INSERT INTO cookies (
-                creation_utc, host_key, top_frame_site_key, name, value, encrypted_value, path,
-                expires_utc, is_secure, is_httponly, last_access_utc, has_expires, is_persistent,
-                priority, samesite, source_scheme, source_port, last_update_utc, source_type, has_cross_site_ancestor
-            ) VALUES (?, ?, ?, ?, '', ?, ?, ?, 1, 0, ?, 1, 1, 1, 0, 2, 443, ?, 0, 0)''',
-            (creation_utc, domain, domain, name, encrypted_value, path, expires_date, creation_utc, creation_utc))
-        else:
-            cursor.execute('''INSERT INTO cookies (
-                creation_utc, host_key, name, value, encrypted_value, path, expires_utc,
-                is_secure, is_httponly, last_access_utc, has_expires, is_persistent,
-                priority, samesite, source_scheme, source_port, is_same_party
-            ) VALUES (?, ?, ?, '', ?, ?, ?, 1, 0, ?, 1, 1, 1, 0, 2, 443, 0)''',
-            (creation_utc, domain, name, encrypted_value, path, expires_date, creation_utc))
-        injected += 1
-
-conn.commit()
-conn.close()
-
-print(f"Complete: {injected} inserted, {updated} updated")
-`;
-
-    const scriptPath = `/tmp/inject-cookies-${Date.now()}.py`;
-    printInfo('Transferring injection script to remote...');
-    exec(`ssh ${options.host} "cat > ${scriptPath}" <<'EOFSCRIPT'\n${injectionScript}\nEOFSCRIPT`);
-
-    printInfo('Executing injection on remote...');
-    console.log('');
-
-    const result = exec(`ssh ${options.host} "python3 ${scriptPath} 2>&1"`, {
-      encoding: 'utf-8',
-      stdio: 'pipe'
-    });
-
-    console.log(result.toString());
-
-    exec(`ssh ${options.host} "rm -f ${scriptPath}"`);
-
-    printSuccess('Remote cookie injection complete!');
-    printInfo('');
-    printInfo('Cookies have been injected into remote Chromium.');
-    printInfo('Open Chromium on the remote machine to use them.');
-
-  } catch (e) {
-    printError(`Remote injection failed: ${(e as Error).message}`);
-    process.exit(1);
-  }
-}
-
 async function cmdNotifications(options: {
   refresh?: boolean;
   json?: boolean;
@@ -756,7 +241,7 @@ async function cmdNotifications(options: {
   offset?: string;
   parallel?: string;
 }): Promise<void> {
-  const client = await createClient(options);
+  const client = await createClient();
   let { items, raw } = await client.fetchWorldItems();
 
   let mentionsShortcutId: string | undefined;
@@ -983,7 +468,7 @@ async function cmdMessages(
   spaceId: string,
   options: { refresh?: boolean; json?: boolean; limit?: string; profile?: string }
 ): Promise<void> {
-  const client = await createClient(options);
+  const client = await createClient();
   const limit = parseInt(options.limit || '20', 10);
 
   const result = await client.getThreads(spaceId, { pageSize: limit });
@@ -1017,7 +502,7 @@ async function cmdThreads(
     profile?: string;
   }
 ): Promise<void> {
-  const client = await createClient(options);
+  const client = await createClient();
 
   const pages = parseInt(options.pages || '1', 10);
   const pageSize = parseInt(options.pageSize || '25', 10);
@@ -1073,7 +558,7 @@ async function cmdThread(
   topicId: string,
   options: { refresh?: boolean; json?: boolean; profile?: string }
 ): Promise<void> {
-  const client = await createClient(options);
+  const client = await createClient();
   const result = await client.getThread(spaceId, topicId);
 
   if (options.json) {
@@ -1100,7 +585,7 @@ async function cmdDMs(
     unread?: boolean;
   }
 ): Promise<void> {
-  const client = await createClient(options);
+  const client = await createClient();
 
   const limit = parseInt(options.limit || '0', 10);
   const messagesPerDM = parseInt(options.messagesLimit || '10', 10);
@@ -1143,7 +628,7 @@ async function cmdSearch(
   query: string,
   options: { refresh?: boolean; json?: boolean; space?: string; profile?: string }
 ): Promise<void> {
-  const client = await createClient(options);
+  const client = await createClient();
 
   let matches;
   if (options.space) {
@@ -1180,7 +665,7 @@ async function cmdFindSpace(
   query: string,
   options: { refresh?: boolean; json?: boolean; profile?: string }
 ): Promise<void> {
-  const client = await createClient(options);
+  const client = await createClient();
   const matches = await client.findSpaces(query);
 
   if (options.json) {
@@ -1255,7 +740,7 @@ async function cmdExport(
     cacheDir?: string;
   }
 ): Promise<void> {
-  const client = await createClient(options);
+  const client = await createClient();
 
   const outputFile =
     options.output
@@ -1440,7 +925,7 @@ async function cmdStayOnline(options: {
   console.log(`  Subscribe to spaces: ${options.subscribe ? 'yes' : 'no'}`);
   console.log(`  Press Ctrl+C to stop\n`);
 
-  const client = await createClient(options);
+  const client = await createClient();
   let lastPingCount = 0;
   let isShuttingDown = false;
 
@@ -2105,14 +1590,9 @@ const program = new Command();
 
 program
   .name('gchat')
-  .description('Google Chat CLI client (extracts cookies from browser automatically)')
+  .description('Google Chat CLI client')
   .version('1.0.0')
   .option('--no-color', 'Disable colored output')
-  .option('-b, --browser <type>', 'Browser to use: chrome, brave, edge, chromium, arc (run "gchat browsers" to list)')
-  .option('-p, --profile <name>', 'Browser profile to use (run "gchat profiles" to list)')
-  .option('--cookie-path <path>', 'Custom path to cookie database file')
-  .option('--cache-dir <path>', `Cache directory for auth state (default: ${DEFAULT_CACHE_DIR})`)
-  .option('--refresh', 'Force refresh authentication (re-extract cookies from browser)')
   .option('--json', 'Output as JSON')
   .option('--debug', 'Enable debug output')
   .option('--log-level <level>', 'Set log level (error, warn, info, debug, silent)', 'info')
@@ -2127,364 +1607,6 @@ program
       setLogLevel('debug');
     } else if (opts.logLevel) {
       setLogLevel(opts.logLevel as LogLevel);
-    }
-    if (opts.cookiePath) {
-      setCustomCookiePath(opts.cookiePath);
-    } else if (opts.browser) {
-      setBrowser(opts.browser as BrowserType);
-    }
-    if (opts.profile) {
-      setProfile(opts.profile);
-    }
-  });
-
-program
-  .command('browsers')
-  .description('List available browsers and their profiles')
-  .option('--json', 'Output as JSON')
-  .action((opts) => {
-    try {
-      const browsersWithProfiles = listBrowsersWithProfiles();
-
-      if (browsersWithProfiles.length === 0) {
-        printError('No supported browsers found');
-        process.exit(1);
-      }
-
-      if (opts.json) {
-        console.log(JSON.stringify(browsersWithProfiles, null, 2));
-        return;
-      }
-
-      printHeader('Available Browsers');
-      console.log();
-
-      for (const { browser, profiles } of browsersWithProfiles) {
-        console.log(`  ${c('green', browser.name)} (${c('dim', browser.type)})`);
-        console.log(`    Path: ${c('dim', browser.basePath)}`);
-        console.log(`    Profiles: ${profiles.length > 0 ? profiles.map(p => c('cyan', p)).join(', ') : c('dim', 'none')}`);
-        console.log();
-      }
-
-      console.log(`Use ${c('yellow', '--browser <type>')} to select a browser (chrome, brave, edge, chromium, arc)`);
-      console.log(`Use ${c('yellow', '--profile <name>')} to select a profile`);
-      console.log(`Use ${c('yellow', '--cookie-path <path>')} to use a custom cookie database`);
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-program
-  .command('profiles')
-  .description('List available browser profiles')
-  .option('--browser <type>', 'Browser type (chrome, brave, edge, chromium, arc)', 'chrome')
-  .action((opts) => {
-    try {
-      if (opts.browser) {
-        setBrowser(opts.browser as BrowserType);
-      }
-
-      const profiles = listProfiles();
-      const browserName = getBrowser();
-
-      if (profiles.length === 0) {
-        printError(`No profiles found for ${browserName}`);
-        process.exit(1);
-      }
-
-      printHeader(`Found ${profiles.length} ${browserName} profiles`);
-      for (const profile of profiles) {
-        console.log(`  ${c('cyan', profile)}`);
-      }
-      console.log(`\nUse ${c('yellow', '--profile <name>')} to select a profile`);
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-const authCmd = program
-  .command('auth')
-  .description('Authentication and cookie helpers')
-  .action(async () => {
-    try {
-      await cmdAuth(program.opts());
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-authCmd
-  .command('status')
-  .description('Show cached XSRF token age/expiry')
-  .action(async () => {
-    try {
-      await cmdAuthCheckExpires(program.opts());
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-authCmd
-  .command('refresh')
-  .description('Force refresh authentication (bypass cache)')
-  .action(async () => {
-    try {
-      await cmdAuthForceRefresh(program.opts());
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-authCmd
-  .command('clear-cache')
-  .description('Clear cached cookies and XSRF token')
-  .action(() => {
-    try {
-      cmdAuthRemoveCache(program.opts());
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-authCmd
-  .command('watch')
-  .description('Continuously refresh authentication every N minutes (default: 5)')
-  .option('-i, --interval <minutes>', 'Refresh interval in minutes (default: 5)', '5')
-  .action(async (opts) => {
-    try {
-      await cmdAuthWatch({ ...program.opts(), ...opts });
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-authCmd
-  .command('browsers')
-  .description('List available browsers and their profiles')
-  .option('--json', 'Output as JSON')
-  .action((opts) => {
-    try {
-      const browsersWithProfiles = listBrowsersWithProfiles();
-
-      if (browsersWithProfiles.length === 0) {
-        printError('No supported browsers found');
-        process.exit(1);
-      }
-
-      if (opts.json) {
-        console.log(JSON.stringify(browsersWithProfiles, null, 2));
-        return;
-      }
-
-      printHeader('Available Browsers');
-      console.log();
-
-      for (const { browser, profiles } of browsersWithProfiles) {
-        console.log(`  ${c('green', browser.name)} (${c('dim', browser.type)})`);
-        console.log(`    Path: ${c('dim', browser.basePath)}`);
-        console.log(`    Profiles: ${profiles.length > 0 ? profiles.map(p => c('cyan', p)).join(', ') : c('dim', 'none')}`);
-        console.log();
-      }
-
-      console.log(`Use ${c('yellow', '--browser <type>')} to select a browser (chrome, brave, edge, chromium, arc)`);
-      console.log(`Use ${c('yellow', '--profile <name>')} to select a profile`);
-      console.log(`Use ${c('yellow', '--cookie-path <path>')} to use a custom cookie database`);
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-authCmd
-  .command('profiles')
-  .description('List available browser profiles')
-  .option('--browser <type>', 'Browser type (chrome, brave, edge, chromium, arc)', 'chrome')
-  .action((opts) => {
-    try {
-      if (opts.browser) {
-        setBrowser(opts.browser as BrowserType);
-      }
-
-      const profiles = listProfiles();
-      const browserName = getBrowser();
-
-      if (profiles.length === 0) {
-        printError(`No profiles found for ${browserName}`);
-        process.exit(1);
-      }
-
-      printHeader(`Found ${profiles.length} ${browserName} profiles`);
-      for (const profile of profiles) {
-        console.log(`  ${c('cyan', profile)}`);
-      }
-      console.log(`\nUse ${c('yellow', '--profile <name>')} to select a profile`);
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-authCmd
-  .command('export-cookies')
-  .description('Export cookies from browser to stdout or file')
-  .option('-o, --output <file>', 'Output file (default: stdout)')
-  .action(async (opts) => {
-    try {
-      const client = await createClient({ ...program.opts(), ...opts });
-      const cookieString = client.getCookieString();
-
-      if (opts.output) {
-        writeFileSync(opts.output, cookieString);
-        printSuccess(`Cookies exported to ${opts.output}`);
-      } else {
-        console.log(cookieString);
-      }
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-authCmd
-  .command('inject')
-  .description('Inject cookies into Chrome profile (Chrome must be closed)')
-  .option('-f, --file <path>', 'Cookie file path (default: cookies.txt)', 'cookies.txt')
-  .option('-d, --domain <domain>', 'Domain for cookies (default: .google.com)', '.google.com')
-  .option('-e, --expires <days>', 'Days until expiration (default: 365)', '365')
-  .action(async (opts) => {
-    try {
-      await cmdAuthInjectCookies({ ...program.opts(), ...opts });
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-authCmd
-  .command('inject-remote')
-  .description('Inject cookies into Chromium on remote machine via SSH')
-  .requiredOption('-H, --host <host>', 'SSH host (e.g., user@hostname or homelab)')
-  .option('-f, --file <path>', 'Cookie file path (default: cookies.txt)', 'cookies.txt')
-  .option('-d, --domain <domain>', 'Domain for cookies (default: .google.com)', '.google.com')
-  .option('-e, --expires <days>', 'Days until expiration (default: 365)', '365')
-  .option('-b, --browser-path <path>', 'Remote cookie database path (default: ~/snap/chromium/common/chromium/Default/Cookies)')
-  .option('--password <password>', 'Encryption password for Linux (default: peanuts)', 'peanuts')
-  .action(async (opts) => {
-    try {
-      await cmdAuthInjectCookiesRemote({ ...program.opts(), ...opts });
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-program
-  .command('auth-force-refresh')
-  .description('[deprecated] Use "gchat auth refresh"')
-  .action(async () => {
-    try {
-      await cmdAuthForceRefresh(program.opts());
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-program
-  .command('auth-check-expires')
-  .description('[deprecated] Use "gchat auth status"')
-  .action(async () => {
-    try {
-      await cmdAuthCheckExpires(program.opts());
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-program
-  .command('auth-remove-cache')
-  .description('[deprecated] Use "gchat auth clear-cache"')
-  .action(() => {
-    try {
-      cmdAuthRemoveCache(program.opts());
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-program
-  .command('auth-watch')
-  .description('[deprecated] Use "gchat auth watch"')
-  .option('-i, --interval <minutes>', 'Refresh interval in minutes (default: 5)', '5')
-  .action(async (opts) => {
-    try {
-      await cmdAuthWatch({ ...program.opts(), ...opts });
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-program
-  .command('export-cookies')
-  .description('[deprecated] Use "gchat auth export-cookies"')
-  .option('-o, --output <file>', 'Output file (default: stdout)')
-  .action(async (opts) => {
-    try {
-      const client = await createClient({ ...program.opts(), ...opts });
-      const cookieString = client.getCookieString();
-
-      if (opts.output) {
-        writeFileSync(opts.output, cookieString);
-        printSuccess(`Cookies exported to ${opts.output}`);
-      } else {
-        console.log(cookieString);
-      }
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-program
-  .command('auth-inject-cookies')
-  .description('[deprecated] Use "gchat auth inject"')
-  .option('-f, --file <path>', 'Cookie file path (default: cookies.txt)', 'cookies.txt')
-  .option('-d, --domain <domain>', 'Domain for cookies (default: .google.com)', '.google.com')
-  .option('-e, --expires <days>', 'Days until expiration (default: 365)', '365')
-  .action(async (opts) => {
-    try {
-      await cmdAuthInjectCookies({ ...program.opts(), ...opts });
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
-    }
-  });
-
-program
-  .command('auth-inject-cookies-remote')
-  .description('[deprecated] Use "gchat auth inject-remote"')
-  .requiredOption('-H, --host <host>', 'SSH host (e.g., user@hostname or homelab)')
-  .option('-f, --file <path>', 'Cookie file path (default: cookies.txt)', 'cookies.txt')
-  .option('-d, --domain <domain>', 'Domain for cookies (default: .google.com)', '.google.com')
-  .option('-e, --expires <days>', 'Days until expiration (default: 365)', '365')
-  .option('-b, --browser-path <path>', 'Remote cookie database path (default: ~/snap/chromium/common/chromium/Default/Cookies)')
-  .option('--password <password>', 'Encryption password for Linux (default: peanuts)', 'peanuts')
-  .action(async (opts) => {
-    try {
-      await cmdAuthInjectCookiesRemote({ ...program.opts(), ...opts });
-    } catch (e) {
-      printError((e as Error).message);
-      process.exit(1);
     }
   });
 

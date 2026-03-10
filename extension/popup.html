@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GChat API Bridge</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 13px;
+      margin: 0;
+      padding: 12px 16px;
+      min-width: 240px;
+      background: #fff;
+      color: #202124;
+    }
+    h1 {
+      font-size: 14px;
+      font-weight: 600;
+      margin: 0 0 12px;
+      color: #1a73e8;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .label {
+      color: #5f6368;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .badge.connected    { background: #e6f4ea; color: #137333; }
+    .badge.disconnected { background: #fce8e6; color: #c5221f; }
+    .badge.waiting      { background: #fef7e0; color: #b06000; }
+    .divider {
+      border: none;
+      border-top: 1px solid #e8eaed;
+      margin: 10px 0;
+    }
+    button {
+      width: 100%;
+      padding: 6px 0;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      background: #fff;
+      color: #1a73e8;
+      font-size: 12px;
+      cursor: pointer;
+      margin-top: 4px;
+    }
+    button:hover:not(:disabled) { background: #f1f3f4; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    #btn-mark-read {
+      background: #1a73e8;
+      color: #fff;
+      border-color: #1a73e8;
+      font-weight: 600;
+      margin-top: 10px;
+    }
+    #btn-mark-read:hover:not(:disabled) { background: #1557b0; }
+    #mark-status {
+      font-size: 11px;
+      margin-top: 6px;
+      min-height: 16px;
+      text-align: center;
+    }
+    #mark-status.ok    { color: #137333; }
+    #mark-status.error { color: #c5221f; }
+    #port-note {
+      font-size: 11px;
+      color: #80868b;
+      margin-top: 6px;
+    }
+  </style>
+</head>
+<body>
+  <h1>GChat API Bridge</h1>
+
+  <div class="row">
+    <span class="label">WebSocket</span>
+    <span id="ws-badge" class="badge disconnected">Disconnected</span>
+  </div>
+
+  <div class="row">
+    <span class="label">XSRF token</span>
+    <span id="xsrf-badge" class="badge waiting">Not captured</span>
+  </div>
+
+  <div class="row">
+    <span class="label">Port</span>
+    <span id="port-value">7891</span>
+  </div>
+
+  <hr class="divider" />
+
+  <button id="btn-mark-read">Mark all as read</button>
+  <div id="mark-status"></div>
+
+  <hr class="divider" />
+
+  <button id="btn-reconnect">Reconnect</button>
+  <p id="port-note">Change port via <code>GCHAT_EXTENSION_PORT</code> env var or background message.</p>
+
+  <script src="scripts/popup.js"></script>
+</body>
+</html>

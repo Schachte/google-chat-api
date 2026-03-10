@@ -2,12 +2,9 @@ import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
-import { getCookies, invalidateCache, setProfile } from '../core/auth.js';
 import { GoogleChatClient } from '../core/client.js';
 
 export interface CreateClientOptions {
-  refresh?: boolean;
-  profile?: string;
   cacheDir?: string;
 }
 
@@ -20,24 +17,32 @@ export function resolveCacheDir(options: { cacheDir?: string } = {}): string {
 }
 
 export async function createClient(options: CreateClientOptions = {}): Promise<GoogleChatClient> {
-  if (options.profile) {
-    setProfile(options.profile);
-  }
-
   const cacheDir = resolveCacheDir(options);
   try {
     mkdirSync(cacheDir, { recursive: true });
   } catch {
   }
 
-  if (options.refresh) {
-    invalidateCache(cacheDir);
-  }
+  const { startExtensionBridge } = await import('../core/extension-bridge.js');
+  const bridge = await startExtensionBridge();
 
-  const cookies = getCookies();
+  const client = new GoogleChatClient({}, cacheDir, bridge);
+  await client.authenticateWithExtension();
 
-  const client = new GoogleChatClient(cookies, cacheDir);
-  await client.authenticate(options.refresh);
+  bridge.registerCommandHandler('mark_all_read', async () => {
+    const items = await client.listWorldItems();
+    const unread = items.filter(i => i.unreadCount > 0 || i.unreadReplyCount > 0);
+    let marked = 0;
+    for (const item of unread) {
+      try {
+        await client.markAsRead(item.id);
+        marked++;
+      } catch {
+        // skip individual failures — continue marking the rest
+      }
+    }
+    return { marked, total: unread.length };
+  });
 
   return client;
 }

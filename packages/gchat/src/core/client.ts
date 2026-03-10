@@ -8,6 +8,7 @@ import {
   type Cookies,
   type AuthResult,
 } from './auth.js';
+import { type ExtensionBridge } from './extension-bridge.js';
 import {
   AnnotationType,
   PresenceStatus,
@@ -79,10 +80,13 @@ export class GoogleChatClient {
   private cacheDir: string;
   private selfUserId?: string;
   private _debugLoggedCreator = false;
+  /** When set, all HTTP requests are proxied through the Chrome extension. */
+  private bridge: ExtensionBridge | null = null;
 
-  constructor(cookies: Cookies, cacheDir = '.') {
+  constructor(cookies: Cookies, cacheDir = '.', bridge: ExtensionBridge | null = null) {
     this.cookies = cookies;
     this.cacheDir = cacheDir;
+    this.bridge   = bridge;
   }
 
   async authenticate(forceRefresh = false): Promise<void> {
@@ -91,6 +95,20 @@ export class GoogleChatClient {
       forceRefresh,
       cacheDir: this.cacheDir,
     });
+  }
+
+  /**
+   * Authenticate using the Chrome extension bridge.
+   * Waits for the extension to send its captured XSRF token.
+   */
+  async authenticateWithExtension(tokenTimeoutMs = 30_000): Promise<void> {
+    if (!this.bridge) {
+      throw new Error(
+        'authenticateWithExtension() called but no ExtensionBridge was provided to GoogleChatClient.'
+      );
+    }
+    const { authenticateWithExtension } = await import('./auth.js');
+    this.auth = await authenticateWithExtension({ tokenTimeoutMs });
   }
 
   getCookieString(): string {
@@ -135,6 +153,21 @@ export class GoogleChatClient {
       await this.authenticate();
     }
 
+    if (this.bridge) {
+      const headers: Record<string, string> = {
+        'Origin': API_BASE,
+        'Referer': `${API_BASE}/`,
+        'User-Agent': USER_AGENT,
+        'Content-Type': 'application/json+protobuf',
+        'X-Goog-Encode-Response-If-Executable': 'base64',
+        'x-framework-xsrf-token': this.auth!.xsrfToken,
+        ...extraHeaders,
+      };
+      const bodyStr = body ? JSON.stringify(body) : undefined;
+      const result  = await this.bridge.proxyRequest(url, method, headers, bodyStr);
+      return new Response(result.body, { status: result.status });
+    }
+
     return this.fetchWithAuthRetry(() => {
       const headers: Record<string, string> = {
         'Cookie': this.auth!.cookieString,
@@ -157,6 +190,12 @@ export class GoogleChatClient {
   async proxyFetch(url: string): Promise<Response> {
     if (!this.auth) {
       await this.authenticate();
+    }
+
+    if (this.bridge) {
+      const headers: Record<string, string> = { 'User-Agent': USER_AGENT };
+      const result = await this.bridge.proxyRequest(url, 'GET', headers);
+      return new Response(result.body, { status: result.status });
     }
 
     const headers: Record<string, string> = {
@@ -187,15 +226,20 @@ export class GoogleChatClient {
       const directDownloadUrl = `${API_BASE}/api/get_attachment_url?url_type=FIFE_URL&attachment_token=${encodeURIComponent(attachmentToken)}&sz=w512`;
       log.client.debug('getAttachmentUrl: Trying direct download URL:', directDownloadUrl);
 
-      const directResponse = await fetch(directDownloadUrl, {
-        method: 'GET',
-        headers: {
-          'Cookie': this.auth!.cookieString,
-          'User-Agent': USER_AGENT,
-          'Accept': '*/*',
-        },
-        redirect: 'manual',  
-      });
+      const directResponse = this.bridge
+        ? await this.bridge.proxyRequest(directDownloadUrl, 'GET', {
+            'User-Agent': USER_AGENT,
+            'Accept': '*/*',
+          }).then(r => new Response(r.body, { status: r.status }))
+        : await fetch(directDownloadUrl, {
+            method: 'GET',
+            headers: {
+              'Cookie': this.auth!.cookieString,
+              'User-Agent': USER_AGENT,
+              'Accept': '*/*',
+            },
+            redirect: 'manual',
+          });
 
       log.client.debug('getAttachmentUrl: Direct response status:', directResponse.status);
 
@@ -229,16 +273,22 @@ export class GoogleChatClient {
 
       log.client.debug('getAttachmentUrl: Trying POST approach...');
       const postUrl = `${API_BASE}/api/get_attachment_url?alt=json&key=${API_KEY}`;
-      const postResponse = await fetch(postUrl, {
-        method: 'POST',
-        headers: {
-          'Cookie': this.auth!.cookieString,
-          'User-Agent': USER_AGENT,
-          'Content-Type': 'application/json+protobuf',
-          'Accept': 'application/json',
-        },
-        body: JSON.stringify([attachmentToken]),  
-      });
+      const postResponse = this.bridge
+        ? await this.bridge.proxyRequest(postUrl, 'POST', {
+            'User-Agent': USER_AGENT,
+            'Content-Type': 'application/json+protobuf',
+            'Accept': 'application/json',
+          }, JSON.stringify([attachmentToken])).then(r => new Response(r.body, { status: r.status }))
+        : await fetch(postUrl, {
+            method: 'POST',
+            headers: {
+              'Cookie': this.auth!.cookieString,
+              'User-Agent': USER_AGENT,
+              'Content-Type': 'application/json+protobuf',
+              'Accept': 'application/json',
+            },
+            body: JSON.stringify([attachmentToken]),
+          });
 
       log.client.debug('getAttachmentUrl: POST response status:', postResponse.status);
 
@@ -273,17 +323,30 @@ export class GoogleChatClient {
     url.searchParams.set('alt', 'protojson');
     url.searchParams.set('key', API_KEY);
 
-    const response = await this.fetchWithAuthRetry(() => fetch(url.toString(), {
-      method: 'POST',
-      headers: {
-        'Cookie': this.auth!.cookieString,
+    let response: Response;
+
+    if (this.bridge) {
+      const headers: Record<string, string> = {
         'User-Agent': USER_AGENT,
         'Content-Type': 'application/x-protobuf',
         'Connection': 'Keep-Alive',
         'x-framework-xsrf-token': this.auth!.xsrfToken,
-      },
-      body: protoData,
-    }));
+      };
+      const result = await this.bridge.proxyRequest(url.toString(), 'POST', headers, protoData);
+      response = new Response(result.body, { status: result.status });
+    } else {
+      response = await this.fetchWithAuthRetry(() => fetch(url.toString(), {
+        method: 'POST',
+        headers: {
+          'Cookie': this.auth!.cookieString,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/x-protobuf',
+          'Connection': 'Keep-Alive',
+          'x-framework-xsrf-token': this.auth!.xsrfToken,
+        },
+        body: protoData,
+      }));
+    }
 
     if (!response.ok) {
       const text = await response.text();
@@ -307,19 +370,32 @@ export class GoogleChatClient {
     const url = new URL(`${API_BASE}/api/${endpoint}`);
     url.searchParams.set('c', String(this.requestCounter++));
 
-    const response = await this.fetchWithAuthRetry(() => fetch(url.toString(), {
-      method: 'POST',
-      headers: {
-        'Cookie': this.auth!.cookieString,
-        'User-Agent': USER_AGENT,
-        'Content-Type': 'application/json',
-        'x-framework-xsrf-token': this.auth!.xsrfToken,
-        'Origin': 'https://chat.google.com',
-        'Referer': 'https://chat.google.com/',
-        ...(spaceId ? { 'x-goog-chat-space-id': spaceId } : {}),
-      },
-      body: JSON.stringify(payload),
-    }));
+    const headers: Record<string, string> = {
+      'User-Agent': USER_AGENT,
+      'Content-Type': 'application/json',
+      'x-framework-xsrf-token': this.auth!.xsrfToken,
+      'Origin': 'https://chat.google.com',
+      'Referer': 'https://chat.google.com/',
+      ...(spaceId ? { 'x-goog-chat-space-id': spaceId } : {}),
+    };
+
+    let response: Response;
+
+    if (this.bridge) {
+      const result = await this.bridge.proxyRequest(
+        url.toString(), 'POST', headers, JSON.stringify(payload)
+      );
+      response = new Response(result.body, { status: result.status });
+    } else {
+      response = await this.fetchWithAuthRetry(() => fetch(url.toString(), {
+        method: 'POST',
+        headers: {
+          'Cookie': this.auth!.cookieString,
+          ...headers,
+        },
+        body: JSON.stringify(payload),
+      }));
+    }
 
     if (!response.ok) {
       const text = await response.text();
@@ -3582,6 +3658,14 @@ export class GoogleChatClient {
     groupId: string,
     unreadCount?: number
   ): Promise<MarkGroupReadstateResult> {
+    // In extension mode, markAsReadBatchExecute uses raw fetch() with Cookie headers
+    // which won't work (cookieString is empty). Go straight to the proto path which
+    // is properly routed through the extension bridge.
+    if (this.bridge) {
+      log.client.info(`markAsRead: extension mode – using JSON path for ${groupId}`);
+      return this.markAsReadJson(groupId);
+    }
+
     log.client.info(`markAsRead: trying batchexecute for ${groupId}`);
     const batchResult = await this.markAsReadBatchExecute(groupId, unreadCount);
     if (batchResult.success) {
@@ -3589,8 +3673,8 @@ export class GoogleChatClient {
       return batchResult;
     }
 
-    log.client.info(`markAsRead: batchexecute failed (${batchResult.error}), trying protobuf`);
-    return this.markAsReadProto(groupId);
+    log.client.info(`markAsRead: batchexecute failed (${batchResult.error}), trying JSON`);
+    return this.markAsReadJson(groupId);
   }
 
   private async markAsReadBatchExecute(
@@ -3665,23 +3749,31 @@ export class GoogleChatClient {
     }
   }
 
-  async markAsReadProto(
+  async markAsReadJson(
     groupId: string,
     lastReadTimeMicros?: number
   ): Promise<MarkGroupReadstateResult> {
     try {
       const timestamp = lastReadTimeMicros ?? Date.now() * 1000;
-      log.client.debug(`markAsReadProto: groupId=${groupId}, timestamp=${timestamp}, isDm=${isDmId(groupId)}`);
+      const isDirectMessage = isDmId(groupId);
+      log.client.debug(`markAsReadJson: groupId=${groupId}, timestamp=${timestamp}, isDm=${isDirectMessage}`);
 
-      const protoData = encodeMarkGroupReadstateRequest(groupId, timestamp);
-      log.client.debug(`markAsReadProto: encoded ${protoData.length} bytes`);
+      // 99-element pblite payload matching the mark_group_readstate JSON API.
+      // Field 1 = spaceId wrapper → [[groupId]] for spaces
+      // Field 2 = dmId wrapper   → [null, [groupId]] for DMs (pblite field offset)
+      const payload: unknown[] = new Array(99).fill(null);
+      payload[0]  = isDirectMessage ? [null, [groupId]] : [[groupId]];
+      payload[1]  = timestamp;
+      payload[98] = this.buildPbliteRequestHeader();
 
-      const data = await this.apiRequest<unknown[]>('mark_group_readstate', protoData);
-      log.client.debug(`markAsReadProto: response=${JSON.stringify(data).slice(0, 500)}`);
+      log.client.debug(`markAsReadJson: payload[0]=${JSON.stringify(payload[0])}`);
 
-      return this.parseMarkReadstateResponse(data, groupId);
+      await this.apiRequestJson<unknown[]>('mark_group_readstate', payload, groupId);
+      log.client.info(`markAsReadJson: success for ${groupId}`);
+
+      return { success: true, groupId };
     } catch (error) {
-      log.client.error(`markAsReadProto: error=${error instanceof Error ? error.message : error}`);
+      log.client.error(`markAsReadJson: error=${error instanceof Error ? error.message : error}`);
       return {
         success: false,
         groupId,

@@ -1278,9 +1278,15 @@ export async function startApiServer(options: StartApiServerOptions = {}): Promi
     log.server.info('  GET  /health                         - Health check');
     log.server.info('Press Ctrl+C to stop');
 
-    initChannel(cookieString, client).catch(err => {
-      log.channel.error('Init error:', err.message);
-    });
+    if (cookieString) {
+      // WebChannel uses direct streaming HTTP — not compatible with extension
+      // mode (where cookieString is empty). Skip silently in that case.
+      initChannel(cookieString, client).catch(err => {
+        log.channel.error('Init error:', err.message);
+      });
+    } else {
+      log.channel.info('Extension mode: skipping WebChannel (real-time push events unavailable)');
+    }
     });
   };
 
