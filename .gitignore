@@ -93,6 +93,10 @@ extract-cookies.mjs
 test-cookies.mjs
 yarn.lock
 
+# Example credentials (users must supply their own)
+examples/chrome-api-extension/config.js
+examples/chrome-api-extension/.env
+
 # Project-specific auth/tokens (Google Chat API)
 tokens.json
 cached_auth.json

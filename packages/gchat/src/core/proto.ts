@@ -163,11 +163,28 @@ message UserMentionMetadata {
   int32 mention_type = 3;
 }
 
+message ImageDimensions {
+  int32 width = 1;
+  int32 height = 2;
+}
+
+message UploadMetadata {
+  string attachment_token = 1;
+  string filename = 3;
+  string content_type = 4;
+  ImageDimensions dimensions = 5;
+  repeated int32 upload_type = 12;
+  string original_content_type = 24;
+  string sha256_hash = 25;
+}
+
 message Annotation {
   int32 type = 1;
   int32 start_index = 2;
   int32 length = 3;
   UserMentionMetadata user_mention_metadata = 5;
+  string upload_identifier = 9;
+  UploadMetadata upload_metadata = 10;
 }
 
 message CreateTopicRequest {
@@ -322,7 +339,11 @@ export enum DndState {
   DND = 2,
 }
 
-export function encodePaginatedWorldRequest(pageSize = 100, cursor?: number): Uint8Array {
+export function encodePaginatedWorldRequest(
+  pageSize = 100,
+  cursor?: number,
+  paginationToken?: string,
+): Uint8Array {
   const root = loadProto();
   const PaginatedWorldRequest = root.lookupType('PaginatedWorldRequest');
 
@@ -333,6 +354,9 @@ export function encodePaginatedWorldRequest(pageSize = 100, cursor?: number): Ui
     };
     if (cursor !== undefined) {
       request.anchorSortTimestampMicros = cursor;
+    }
+    if (paginationToken !== undefined) {
+      request.paginationToken = paginationToken;
     }
     return request;
   };
@@ -356,7 +380,7 @@ export function encodePaginatedWorldRequest(pageSize = 100, cursor?: number): Ui
 }
 
 export function isDmId(groupId: string): boolean {
-  return !groupId.startsWith('AAAA');
+  return !groupId.startsWith('AA');
 }
 
 export function encodeListTopicsRequest(
@@ -479,11 +503,37 @@ function generateLocalId(): string {
   return `node-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+export interface UploadAnnotationOptions {
+  attachmentToken: string;
+  filename: string;
+  contentType: string;
+  fileSize: number;
+  sha256hex: string;
+}
+
+function buildUploadAnnotation(opts: UploadAnnotationOptions) {
+  return {
+    type: 13, // UPLOAD_METADATA
+    startIndex: 0,
+    length: 0,
+    uploadIdentifier: `${opts.filename}${opts.fileSize}0`,
+    uploadMetadata: {
+      attachmentToken: opts.attachmentToken,
+      filename: opts.filename,
+      contentType: opts.contentType,
+      uploadType: [3],
+      originalContentType: 'undefined',
+      sha256Hash: Buffer.from(opts.sha256hex).toString('base64'),
+    },
+  };
+}
+
 export function encodeCreateTopicRequest(
   groupId: string,
   text: string,
   localId?: string,
-  isDm?: boolean
+  isDm?: boolean,
+  uploadAnnotation?: UploadAnnotationOptions,
 ): Uint8Array {
   const isDirectMessage = isDm ?? isDmId(groupId);
 
@@ -494,7 +544,7 @@ export function encodeCreateTopicRequest(
     ? { dmId: { dmId: groupId } }      
     : { spaceId: { spaceId: groupId } }; 
 
-  const message = CreateTopicRequest.create({
+  const payload: Record<string, unknown> = {
     requestHeader: createRequestHeader(),
     textBody: text,
     localId: localId || generateLocalId(),
@@ -502,8 +552,13 @@ export function encodeCreateTopicRequest(
     messageInfo: {
       acceptFormatAnnotations: true,
     },
-  });
+  };
 
+  if (uploadAnnotation) {
+    payload.annotations = [buildUploadAnnotation(uploadAnnotation)];
+  }
+
+  const message = CreateTopicRequest.create(payload);
   return CreateTopicRequest.encode(message).finish();
 }
 
@@ -512,7 +567,8 @@ export function encodeCreateMessageRequest(
   topicId: string,
   text: string,
   localId?: string,
-  isDm?: boolean
+  isDm?: boolean,
+  uploadAnnotation?: UploadAnnotationOptions,
 ): Uint8Array {
   const isDirectMessage = isDm ?? isDmId(groupId);
 
@@ -523,7 +579,7 @@ export function encodeCreateMessageRequest(
     ? { dmId: { dmId: groupId } }      
     : { spaceId: { spaceId: groupId } }; 
 
-  const message = CreateMessageRequest.create({
+  const payload: Record<string, unknown> = {
     requestHeader: createRequestHeader(),
     parentId: {
       topicId: {
@@ -536,8 +592,13 @@ export function encodeCreateMessageRequest(
     messageInfo: {
       acceptFormatAnnotations: true,
     },
-  });
+  };
 
+  if (uploadAnnotation) {
+    payload.annotations = [buildUploadAnnotation(uploadAnnotation)];
+  }
+
+  const message = CreateMessageRequest.create(payload);
   return CreateMessageRequest.encode(message).finish();
 }
 

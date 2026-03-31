@@ -1,0 +1,15 @@
+{
+  "name": "gchat-notification-manager",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run index.ts"
+  },
+  "dependencies": {
+    "gchat-cli": "file:../../packages/gchat"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.10"
+  }
+}

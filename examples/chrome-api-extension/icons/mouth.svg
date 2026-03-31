@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- Outer lip shape -->
+  <path d="M12,64 Q30,20 64,28 Q98,20 116,64 Q98,112 64,104 Q30,112 12,64 Z"
+        fill="#E8838F" stroke="#2D2D2D" stroke-width="3" stroke-linejoin="round"/>
+  <!-- Upper lip highlight -->
+  <path d="M20,60 Q42,30 64,36 Q86,30 108,60"
+        fill="#F4A6B0" stroke="none"/>
+  <!-- Mouth opening / teeth area -->
+  <path d="M24,64 Q64,48 104,64 Q64,80 24,64 Z"
+        fill="#FFFFFF" stroke="none"/>
+  <!-- Tooth dividers -->
+  <g stroke="#E0E0E0" stroke-width="1.5" stroke-linecap="round">
+    <line x1="44" y1="58" x2="44" y2="70"/>
+    <line x1="56" y1="56" x2="56" y2="72"/>
+    <line x1="64" y1="55" x2="64" y2="73"/>
+    <line x1="72" y1="56" x2="72" y2="72"/>
+    <line x1="84" y1="58" x2="84" y2="70"/>
+  </g>
+  <!-- Tongue -->
+  <ellipse cx="64" cy="78" rx="20" ry="14" fill="#E06B7A"/>
+  <ellipse cx="64" cy="76" rx="18" ry="10" fill="#D4546A"/>
+  <!-- Tongue center line -->
+  <line x1="64" y1="70" x2="64" y2="88" stroke="#C4445A" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- Lower lip shadow -->
+  <path d="M30,72 Q64,100 98,72 Q80,108 64,100 Q48,108 30,72 Z"
+        fill="#D4708A" opacity="0.3" stroke="none"/>
+</svg>

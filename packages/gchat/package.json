@@ -4,7 +4,8 @@
   "description": "Google Chat CLI client",
   "main": "dist/index.js",
   "bin": {
-    "gchat": "./dist/cli.js"
+    "gchat": "./dist/cli.js",
+    "GChat": "./dist/cli.js"
   },
   "type": "module",
   "scripts": {
@@ -15,6 +16,8 @@
     "start": "node dist/cli.js",
     "serve": "node dist/cli.js api",
     "serve:watch": "tsx watch --clear-screen=false src/cli.ts api",
+    "bridge": "node dist/cli.js bridge",
+    "bridge:watch": "tsx watch --clear-screen=false src/cli.ts bridge",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint src/**/*.ts"

@@ -615,6 +615,37 @@ export async function generatePeopleApiAuthHeader(
   return parts.join(' ');
 }
 
+/**
+ * Authenticate using the Chrome extension bridge.
+ *
+ * The bridge must already be started (or the caller must start it).  This
+ * function waits up to `tokenTimeoutMs` for the extension to send the XSRF
+ * token captured from Google Chat's page context, then returns an AuthResult
+ * with an empty cookieString — cookies are sent by the browser automatically
+ * when requests are proxied through the extension.
+ */
+export async function authenticateWithExtension(options: {
+  tokenTimeoutMs?: number;
+} = {}): Promise<AuthResult> {
+  const { tokenTimeoutMs = 60_000 } = options;
+
+  // Dynamic import to avoid pulling ws into builds that don't need it
+  const { getExtensionBridge } = await import('./extension-bridge.js');
+  const bridge = getExtensionBridge();
+
+  // Don't check isConnected() here — the extension may connect a moment after
+  // the server starts. waitForToken() handles the wait + timeout.
+  log.auth.info('[ExtensionAuth] Waiting for extension to connect and capture XSRF token...');
+  const xsrfToken = await bridge.waitForToken(tokenTimeoutMs);
+  log.auth.info('[ExtensionAuth] XSRF token received');
+
+  return {
+    cookies:      {},
+    xsrfToken,
+    cookieString: '',   // cookies flow through the browser, not this header
+  };
+}
+
 export async function main() {
   const args = process.argv.slice(2);
   const forceRefresh = args.includes('--refresh') || args.includes('-r');

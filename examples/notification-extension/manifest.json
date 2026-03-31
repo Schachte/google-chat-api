@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "Google Chat Notification Wizard",
+  "version": "1.0.0",
+  "description": "Standalone notification manager for Google Chat — no server required",
+  "permissions": ["storage", "activeTab", "scripting", "tabs"],
+  "host_permissions": [
+    "https://mail.google.com/*",
+    "https://chat.google.com/*"
+  ],
+  "background": {
+    "service_worker": "scripts/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://mail.google.com/chat/*",
+        "https://chat.google.com/*"
+      ],
+      "js": ["scripts/page.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://mail.google.com/chat/*",
+        "https://chat.google.com/*"
+      ],
+      "js": ["scripts/content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Google Chat Notification Wizard"
+  }
+}

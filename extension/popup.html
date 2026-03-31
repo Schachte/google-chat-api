@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GChat API Bridge</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 13px;
+      width: 280px;
+      padding: 14px 16px;
+      background: #1e1e1e;
+      color: #d4d4d4;
+    }
+
+    h1 {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 12px;
+      color: #4fc3f7;
+    }
+
+    /* ── Status rows ── */
+    .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+    .label {
+      color: #9e9e9e;
+      font-size: 13px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .badge.connected    { background: #1b3a2a; color: #4caf50; }
+    .badge.disconnected { background: #3a1b1b; color: #ef5350; }
+    .badge.waiting      { background: #3a2e1b; color: #ffb74d; }
+
+    .divider {
+      border: none;
+      border-top: 1px solid #333;
+      margin: 10px 0;
+    }
+
+    /* ── Server address ── */
+    .server-label {
+      color: #9e9e9e;
+      font-size: 12px;
+      margin-bottom: 5px;
+    }
+    .server-field {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    #server-input {
+      flex: 1 1 auto;
+      width: 100%;
+      font-family: 'SF Mono', SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      padding: 5px 8px;
+      border: 1px solid #444;
+      border-radius: 4px;
+      color: #e0e0e0;
+      background: #2a2a2a;
+    }
+    #server-input:focus {
+      outline: none;
+      border-color: #4fc3f7;
+      background: #333;
+    }
+    .btn-inline {
+      flex: 0 0 auto;
+      padding: 5px 12px;
+      border: 1px solid #444;
+      border-radius: 4px;
+      background: #2a2a2a;
+      color: #4fc3f7;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .btn-inline:hover:not(:disabled) { background: #383838; }
+    .btn-inline:disabled { opacity: 0.4; cursor: default; }
+
+    #server-status {
+      font-size: 11px;
+      min-height: 14px;
+      margin-top: 4px;
+    }
+    #server-status.ok    { color: #4caf50; }
+    #server-status.error { color: #ef5350; }
+
+    /* ── Action buttons ── */
+    .btn-action {
+      display: block;
+      width: 100%;
+      padding: 7px 0;
+      border: 1px solid #444;
+      border-radius: 4px;
+      background: #2a2a2a;
+      color: #4fc3f7;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      text-align: center;
+    }
+    .btn-action:hover:not(:disabled) { background: #383838; }
+    .btn-action:disabled { opacity: 0.5; cursor: default; }
+  </style>
+</head>
+<body>
+
+<h1>GChat API Bridge</h1>
+
+<div class="row">
+  <span class="label">WebSocket</span>
+  <span id="ws-badge" class="badge disconnected">Disconnected</span>
+</div>
+
+<div class="row">
+  <span class="label">XSRF token</span>
+  <span id="xsrf-badge" class="badge waiting">Not captured</span>
+</div>
+
+<hr class="divider" />
+
+<div class="server-label">Server address</div>
+<div class="server-field">
+  <input id="server-input" type="text" placeholder="localhost:7891" spellcheck="false" autocomplete="off" />
+  <button class="btn-inline" id="btn-save-server">Save</button>
+</div>
+<div id="server-status"></div>
+
+<hr class="divider" />
+
+<button class="btn-action" id="btn-reconnect">Reconnect</button>
+
+<script src="scripts/popup.js"></script>
+</body>
+</html>

@@ -1,106 +1,46 @@
-# Google Chat API (Unofficial)
+# GChat
 
-Google Chat doesn't have an official API for personal/consumer accounts. This repo is a reverse‑engineered TypeScript/Node.js client that talks to the same internal endpoints the web app uses (`chat.google.com`) so you can automate your own Chat account locally.
+Unofficial Google Chat CLI. Talks to the same internal endpoints the web app uses.
 
-## Features
-
-
-- **CLI (`gchat`)**
-  - Search messages
-  - List 
-    - spaces
-    - DMs
-    - threads
-    - messages
-  - Send 
-    - Channel messages
-    - Private messages
-    - Thread replies
-  - Misc
-    - Batch data exporter for spaces and DMs
-    - Stay online (keep yourself logged online)
-    - Browser-based presence (`gchat presence`) via Playwright + storageState
-- **Local HTTP API server**
-  - JSON endpoints for the same operations as the CLI
-  - Web UI at `/ui`
-  - API docs (Scalar) at `/docs`
-- **TypeScript library**
-  - `GoogleChatClient` for programmatic use
-  - `utils` for higher-level workflows:
-    - `utils.startStayOnline()` – maintain presence via WebChannel + refresh
-    - `utils.exportChatBatches()` – cursor-based export batching for large spaces
-- **Cookie-based authentication**
-  - Uses cookies from an already logged-in browser profile + an XSRF token from `/mole/world`
-  - Cache defaults to `~/.gchat` (override with `--cache-dir` or `GCHAT_CACHE_DIR`)
-
-## Run Docs
-
-**Project Documentation:**
-```bash
-npm run dev:docs
-```
-Access at `http://127.0.0.1:8000`
-
-**OpenAPI Docs**
-```bash
-npm run dev
-```
-Access at `http://localhost:3000/docs`
-
-## Run UI
-
-Start the HTTP API server with web interface:
-
-**Development (hot reload):**
-```bash
-npm run dev
-```
-
-**Production:**
-```bash
-npm run serve
-```
-
-**With custom browser or profile:**
-```bash
-npm run dev -- --browser brave --profile "Profile 5"
-```
-
-- UI: `http://localhost:3000/ui`
-- API Docs: `http://localhost:3000/docs`
-
-Supported browsers: `chrome`, `brave`, `edge`, `chromium`, `arc`
-
-## Run CLI
-
-Navigate to the CLI package and run commands:
+## Setup
 
 ```bash
-cd packages/gchat
+npm install && cd packages/gchat && npm install && npm run build
 
-# Check auth status
-npm start -- auth status
-
-# List spaces
-npm start -- spaces
-
-# Send a message
-npm start -- send <space_id> "Your message"
-
-# Export space (last 7 days)
-npm start -- export <space_id> --since 7d --full-threads
-
-# Stay online
-npm start -- stay-online
+# Put gchat on your PATH:
+npm link          # from packages/gchat, or `npm run link` from root
 ```
 
-**With custom browser or profile:**
-```bash
-npm start -- --browser brave --profile "Profile 5" spaces
+## Bridge
+
+Routes requests through a Chrome extension -- cookies never leave the browser.
+
+1. Load `extension/` as unpacked in `chrome://extensions`
+2. Open [chat.google.com](https://chat.google.com)
+3. `gchat bridge` (background, prints PID) or `gchat bridge --foreground`
+
+## Commands
+
+```
+gchat spaces                           list spaces
+gchat messages <id> [--last 50]        messages from a space
+gchat threads <id> [--full]            threaded messages
+gchat dms [--unread]                   DM conversations
+gchat search "query"                   search all spaces
+gchat send <id> "msg" [-t <thread>]    send / reply
+gchat notifications [--me]             unread counts
+gchat export <id> [--since 7d]         export to JSON
+gchat api [--port 3000]                HTTP server (docs at /docs)
+gchat bridge [--foreground]            extension bridge
 ```
 
-Supported browsers: `chrome`, `brave`, `edge`, `chromium`, `arc`
+`--json` for JSON output. `--debug` for verbose logs.
 
----
+## Env
 
-Disclaimer: this uses unofficial/internal Google APIs. Endpoints and auth can change without notice.
+| Variable | Default | |
+|---|---|---|
+| `GCHAT_CACHE_DIR` | `~/.gchat` | Auth/cache dir |
+| `GCHAT_EXTENSION_PORT` | `7891` | Bridge WS port |
+| `GCHAT_TIMEZONE` | `UTC` | Timestamp TZ |
+| `LOG_LEVEL` | `info` | error/warn/info/debug/silent |

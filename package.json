@@ -6,11 +6,14 @@
   "scripts": {
     "dev": "npm run serve:watch --prefix packages/gchat",
     "dev:server": "npm run serve:watch --prefix packages/gchat",
+    "dev:bridge": "npm run bridge:watch --prefix packages/gchat --",
     "dev:docs": "cd documentation && ./serve.sh",
     "dev:all": "concurrently -n server,docs -c blue,green \"npm run dev:server\" \"npm run dev:docs\"",
     "build": "npm run build --prefix packages/gchat",
     "test": "npm test --prefix packages/gchat",
-    "serve": "npm run serve --prefix packages/gchat"
+    "serve": "npm run serve --prefix packages/gchat",
+    "bridge": "npm run bridge --prefix packages/gchat --",
+    "link": "cd packages/gchat && npm link"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

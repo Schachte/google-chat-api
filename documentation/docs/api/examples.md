@@ -79,33 +79,86 @@ curl "http://localhost:3000/api/spaces?pageSize=100&cursor=1705420800000000"
 
 ---
 
+## Notifications
+
+### Get All Notifications
+
+```bash
+curl http://localhost:3000/api/notifications
+```
+
+**Response:**
+```json
+{
+  "badgedDMs": [
+    {
+      "id": "DM_abc123xyz",
+      "name": "Jane Smith, You",
+      "type": "dm",
+      "lastMessageText": "Hey, can you review my PR?",
+      "isSubscribedToSpace": true,
+      "notificationCategory": "badged",
+      "badgeCount": 1,
+      "lastNotifWorthyEventTimestamp": 1773111159996751,
+      "readWatermarkTimestamp": 1773111159996751,
+      "lastNotifWorthyEvent": "March 10, 2026 at 2:52 AM GMT",
+      "readWatermark": "March 10, 2026 at 2:52 AM GMT"
+    }
+  ],
+  "badgedSpaces": [ ... ],
+  "litupDMs": [ ... ],
+  "litupSpaces": [ ... ],
+  "badges": {
+    "totalUnread": 130,
+    "badgedCount": 10,
+    "litUpCount": 120,
+    "serverBadgeTotal": 13
+  },
+  "pagination": { "total": 130, "offset": 0, "limit": 130, "returned": 130, "hasMore": false }
+}
+```
+
+The four sections are **mutually exclusive** — every item appears in exactly one.
+
+| Section | Meaning |
+|---------|---------|
+| `badgedDMs` | DMs with a numbered badge |
+| `badgedSpaces` | Spaces with a numbered badge |
+| `litupDMs` | DMs shown bold (no number) |
+| `litupSpaces` | Spaces shown bold (no number) |
+
+### Filter Notifications
+
+```bash
+# Only badged items (DMs + spaces)
+curl "http://localhost:3000/api/notifications?mentions=true"
+
+# Only lit-up spaces
+curl "http://localhost:3000/api/notifications?spaces=true"
+
+# Badged items that directly @mention you (fetches recent messages)
+curl "http://localhost:3000/api/notifications?me=true&messages=true"
+```
+
+### Timezone Configuration
+
+Timestamps include a human-readable string controlled by the `GCHAT_TIMEZONE` environment variable (IANA format, default: `UTC`):
+
+```bash
+# .env
+GCHAT_TIMEZONE=Europe/London    # → "March 10, 2026 at 2:52 AM GMT"
+GCHAT_TIMEZONE=America/New_York # → "March 9, 2026 at 9:52 PM EST"
+GCHAT_TIMEZONE=UTC              # → "March 10, 2026 at 2:52 AM UTC" (default)
+```
+
+---
+
 ## Direct Messages (DMs)
 
 ### List All DMs
 
 ```bash
 curl http://localhost:3000/api/dms
-```
-
-**Response:**
-```json
-{
-  "dms": [
-    {
-      "id": "DM_abc123xyz",
-      "name": "Jane Smith",
-      "unreadCount": 2,
-      "lastMentionTime": 1705420800000000,
-      "notificationCategory": "direct_message"
-    }
-  ],
-  "total": 1,
-  "pagination": {
-    "offset": 0,
-    "limit": 50,
-    "hasMore": false
-  }
-}
 ```
 
 ### List DMs with Message Previews
@@ -550,13 +603,31 @@ curl "http://localhost:3000/api/dms/presence?dmIds=DM_abc123xyz,DM_def456"
 ### Mark a Space or DM as Read
 
 ```bash
-curl -X POST "http://localhost:3000/api/mark-read/AAAA_abc123xyz" \
+curl -X POST "http://localhost:3000/api/notifications/mark" \
   -H "Content-Type: application/json" \
-  -d '{ "unreadCount": 5 }'
+  -d '{ "groupId": "AAAA_abc123xyz", "action": "read", "unreadCount": 5 }'
 ```
 
 ```bash
-curl -X POST "http://localhost:3000/api/mark-read/DM_abc123xyz"
+curl -X POST "http://localhost:3000/api/notifications/mark" \
+  -H "Content-Type: application/json" \
+  -d '{ "groupId": "DM_abc123xyz", "action": "read" }'
+```
+
+### Mark a Space or DM as Unread
+
+```bash
+curl -X POST "http://localhost:3000/api/notifications/mark" \
+  -H "Content-Type: application/json" \
+  -d '{ "groupId": "AAAA_abc123xyz", "action": "unread" }'
+```
+
+With a specific timestamp (microseconds) to mark as unread from that point:
+
+```bash
+curl -X POST "http://localhost:3000/api/notifications/mark" \
+  -H "Content-Type: application/json" \
+  -d '{ "groupId": "AAAA_abc123xyz", "action": "unread", "timestamp": 1773137691794158 }'
 ```
 
 ---
