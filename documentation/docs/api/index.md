@@ -39,10 +39,10 @@ npm start -- api --port 8080 --host 0.0.0.0
 | POST | `/api/spaces/:spaceId/threads/:topicId/replies` | Reply to a thread |
 | GET | `/api/spaces/:spaceId/messages` | Fetch all messages (multi-page) |
 | POST | `/api/spaces/:spaceId/messages` | Send a new message |
-| GET | `/api/notifications` | World items / notification feed |
+| GET | `/api/notifications` | Notification feed (badgedDMs, badgedSpaces, litupDMs, litupSpaces) |
 | GET | `/api/unreads` | Categorized unreads for UI |
 | GET | `/api/unreads/refresh` | Force refresh unread counts |
-| POST | `/api/mark-read/:groupId` | Mark a space or DM as read |
+| POST | `/api/notifications/mark` | Mark a space or DM as read or unread |
 | GET | `/api/search` | Search messages |
 | GET | `/api/find-spaces` | Find spaces by name |
 | GET | `/api/dms` | List direct messages |
@@ -83,6 +83,63 @@ curl -X POST "http://localhost:3000/api/mark-read/AAAA_space_id"
 # Presence lookup with profile info
 curl "http://localhost:3000/api/presence?userIds=123456789&include=profile"
 ```
+
+### Notifications
+
+```bash
+# Get all notifications (4 mutually exclusive sections)
+curl http://localhost:3000/api/notifications
+
+# Filter by badged items that @mention you
+curl "http://localhost:3000/api/notifications?me=true&messages=true"
+```
+
+**Response:**
+```json
+{
+  "badgedDMs": [
+    {
+      "id": "DM_abc123xyz",
+      "name": "Jane Smith, You",
+      "type": "dm",
+      "lastMessageText": "Hey, can you review my PR?",
+      "isSubscribedToSpace": true,
+      "notificationCategory": "badged",
+      "badgeCount": 1,
+      "lastNotifWorthyEventTimestamp": 1773111159996751,
+      "readWatermarkTimestamp": 1773111159996751,
+      "lastNotifWorthyEvent": "March 10, 2026 at 2:52 AM GMT",
+      "readWatermark": "March 10, 2026 at 2:52 AM GMT"
+    }
+  ],
+  "badgedSpaces": [ ... ],
+  "litupDMs": [ ... ],
+  "litupSpaces": [ ... ],
+  "badges": {
+    "totalUnread": 130,
+    "badgedCount": 10,
+    "litUpCount": 120,
+    "serverBadgeTotal": 13
+  },
+  "pagination": {
+    "total": 130,
+    "offset": 0,
+    "limit": 130,
+    "returned": 130,
+    "hasMore": false
+  }
+}
+```
+
+Each item appears in exactly one section. The notification model has three states matching the Google Chat UI:
+
+| State | Section | Visual in Google Chat |
+|-------|---------|-----------------------|
+| **Badged** | `badgedDMs` / `badgedSpaces` | Numbered notification badge |
+| **Lit up** | `litupDMs` / `litupSpaces` | Bold text, no number |
+| **None** | *(not returned)* | Clean, no indicator |
+
+Timestamps include both the raw microsecond value and a human-readable string. Set `GCHAT_TIMEZONE` in `.env` to control the timezone (default: `UTC`).
 
 See [OpenAPI Docs](openapi.md) for detailed API documentation.
 
@@ -204,6 +261,24 @@ for await (const batch of utils.exportChatBatches(client, 'AAAA_space_id', { sin
   "timestamp_usec": 1705406400000000,
   "sender": "John Doe",
   "has_mention": false
+}
+```
+
+### Notification Item
+
+```json
+{
+  "id": "AAAAxxx",
+  "name": "Team Chat",
+  "type": "space",
+  "lastMessageText": "Hey everyone...",
+  "isSubscribedToSpace": true,
+  "notificationCategory": "badged",
+  "badgeCount": 3,
+  "lastNotifWorthyEventTimestamp": 1773091222522527,
+  "readWatermarkTimestamp": 1772643133819567,
+  "lastNotifWorthyEvent": "March 9, 2026 at 9:20 PM GMT",
+  "readWatermark": "March 4, 2026 at 4:52 PM GMT"
 }
 ```
 

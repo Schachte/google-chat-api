@@ -643,34 +643,33 @@ paths:
             application/json:
               schema:
                 "$ref": "#/components/schemas/ErrorResponse"
-  "/api/mark-read/{groupId}":
+  "/api/notifications/mark":
     post:
-      summary: Mark space or DM as read
-      description: Marks a space or DM as read using the batchexecute flow with protobuf
-        fallback.
-      operationId: markRead
+      summary: Mark space or DM as read or unread
+      description: Marks a space or DM as read or unread. Uses batchexecute with protobuf
+        fallback for read, and set_mark_as_unread_timestamp for unread.
+      operationId: notificationsMark
       tags:
       - Notifications
-      parameters:
-      - name: groupId
-        in: path
-        required: true
-        description: Space or DM identifier.
-        schema:
-          type: string
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
-              "$ref": "#/components/schemas/MarkReadRequest"
+              "$ref": "#/components/schemas/NotificationMarkRequest"
       responses:
         '200':
-          description: Mark read result
+          description: Mark result
           content:
             application/json:
               schema:
                 "$ref": "#/components/schemas/MarkGroupReadstateResult"
+        '400':
+          description: Invalid request (missing groupId or invalid action)
+          content:
+            application/json:
+              schema:
+                "$ref": "#/components/schemas/ErrorResponse"
         '500':
           description: Server error
           content:
@@ -1534,13 +1533,30 @@ components:
           description: Error message when unsuccessful.
       required:
       - success
-    MarkReadRequest:
+    NotificationMarkRequest:
       type: object
-      description: Optional payload for marking a space or DM as read.
+      description: Payload for marking a space or DM as read or unread.
+      required:
+      - groupId
+      - action
       properties:
+        groupId:
+          type: string
+          description: Space or DM identifier.
+        action:
+          type: string
+          enum:
+          - read
+          - unread
+          description: Whether to mark as read or unread.
         unreadCount:
           type: integer
-          description: Unread count to acknowledge (optional).
+          description: Unread count to acknowledge (optional, used with action "read").
+        timestamp:
+          type: integer
+          format: int64
+          description: Microsecond timestamp for mark-as-unread point (optional, used
+            with action "unread"). Defaults to 0 (mark entire conversation as unread).
     MarkGroupReadstateResult:
       type: object
       description: Result of marking a space or DM as read.

@@ -1,11 +1,16 @@
 'use strict';
 
-const wsBadge      = document.getElementById('ws-badge');
-const xsrfBadge    = document.getElementById('xsrf-badge');
-const portValue    = document.getElementById('port-value');
-const btnReconnect = document.getElementById('btn-reconnect');
-const btnMarkRead  = document.getElementById('btn-mark-read');
-const markStatus   = document.getElementById('mark-status');
+const wsBadge        = document.getElementById('ws-badge');
+const xsrfBadge      = document.getElementById('xsrf-badge');
+const serverInput    = document.getElementById('server-input');
+const btnSaveServer  = document.getElementById('btn-save-server');
+const serverStatus   = document.getElementById('server-status');
+const btnReconnect   = document.getElementById('btn-reconnect');
+
+// Track whether the user is actively editing the server field
+let userEditing = false;
+
+// ─── State rendering ─────────────────────────────────────────────────────────
 
 function applyBadge(el, connected, label) {
   el.textContent = label;
@@ -22,36 +27,68 @@ function refresh() {
     applyBadge(xsrfBadge, state.hasXsrf || null,
       state.hasXsrf ? 'Captured' : 'Not captured');
 
-    portValue.textContent = String(state.port || 7891);
+    // Only update the input if the user isn't actively editing it
+    if (!userEditing) {
+      serverInput.value = state.address || `${state.host || 'localhost'}:${state.port || 7891}`;
+    }
   });
 }
 
-btnMarkRead.addEventListener('click', () => {
-  btnMarkRead.disabled = true;
-  markStatus.textContent = 'Marking…';
-  markStatus.className = '';
+// ─── Server address editing ──────────────────────────────────────────────────
 
-  chrome.runtime.sendMessage({ type: 'MARK_ALL_READ' }, (response) => {
-    btnMarkRead.disabled = false;
+serverInput.addEventListener('focus', () => { userEditing = true; });
+serverInput.addEventListener('blur', () => {
+  // Small delay so the Save button click registers before we reset
+  setTimeout(() => { userEditing = false; }, 200);
+});
+
+// Save on Enter key
+serverInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    saveServer();
+  }
+});
+
+btnSaveServer.addEventListener('click', saveServer);
+
+function saveServer() {
+  const address = serverInput.value.trim();
+  if (!address) {
+    serverStatus.textContent = 'Enter a server address';
+    serverStatus.className = 'error';
+    return;
+  }
+
+  btnSaveServer.disabled = true;
+  serverStatus.textContent = 'Saving\u2026';
+  serverStatus.className = '';
+
+  chrome.runtime.sendMessage({ type: 'SET_SERVER', address }, (response) => {
+    btnSaveServer.disabled = false;
+    userEditing = false;
+
     if (chrome.runtime.lastError || !response) {
-      markStatus.textContent = 'Error: ' + (chrome.runtime.lastError?.message ?? 'no response');
-      markStatus.className = 'error';
+      serverStatus.textContent = 'Error: ' + (chrome.runtime.lastError?.message ?? 'no response');
+      serverStatus.className = 'error';
       return;
     }
+
     if (response.ok) {
-      const { marked, total } = response.data ?? {};
-      markStatus.textContent = total === 0
-        ? 'Nothing to mark as read.'
-        : `Marked ${marked} of ${total} space${total !== 1 ? 's' : ''} as read.`;
-      markStatus.className = 'ok';
+      serverInput.value = response.address;
+      serverStatus.textContent = 'Connecting to ' + response.address + '\u2026';
+      serverStatus.className = 'ok';
+      setTimeout(refresh, 800);
     } else {
-      markStatus.textContent = 'Error: ' + (response.error ?? 'unknown');
-      markStatus.className = 'error';
+      serverStatus.textContent = 'Error: ' + (response.error ?? 'unknown');
+      serverStatus.className = 'error';
     }
-    // Clear message after 4 s
-    setTimeout(() => { markStatus.textContent = ''; markStatus.className = ''; }, 4000);
+
+    setTimeout(() => { serverStatus.textContent = ''; serverStatus.className = ''; }, 3000);
   });
-});
+}
+
+// ─── Reconnect ───────────────────────────────────────────────────────────────
 
 btnReconnect.addEventListener('click', () => {
   chrome.runtime.sendMessage({ type: 'RECONNECT_WS' }, () => {
@@ -59,7 +96,16 @@ btnReconnect.addEventListener('click', () => {
   });
 });
 
-// Initial load + poll every 2 s while popup is open
+// ─── Init ────────────────────────────────────────────────────────────────────
+
+// On popup open, check state and auto-reconnect if disconnected.
+chrome.runtime.sendMessage({ type: 'GET_STATE' }, (state) => {
+  if (chrome.runtime.lastError || !state) return;
+  if (!state.connected) {
+    chrome.runtime.sendMessage({ type: 'RECONNECT_WS' });
+  }
+});
+
 refresh();
 const interval = setInterval(refresh, 2000);
 window.addEventListener('unload', () => clearInterval(interval));

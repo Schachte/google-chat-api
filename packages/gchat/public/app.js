@@ -1198,10 +1198,10 @@ async function processMarkReadQueue() {
 
     try {
       console.log('[markAsRead] Sending request for:', id);
-      const response = await fetch(`${API_BASE}/mark-read/${encodeURIComponent(id)}`, {
+      const response = await fetch(`${API_BASE}/notifications/mark`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ unreadCount })
+        body: JSON.stringify({ groupId: id, action: 'read', unreadCount })
       });
 
       const data = await response.json();

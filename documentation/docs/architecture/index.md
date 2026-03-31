@@ -87,8 +87,10 @@ User-Agent: Mozilla/5.0 ...
 
 Google Chat endpoints use protobuf messages, but different endpoints behave differently:
 
-- **Binary protobuf** (`Content-Type: application/x-protobuf`) works broadly.
-- **JSON/PBLite** (`Content-Type: application/json`) is required for reliable `list_topics` cursor pagination (matching the web client).
+- **Binary protobuf** (`Content-Type: application/x-protobuf`) works for most endpoints.
+- **JSON/PBLite** (`Content-Type: application/json`) is required for:
+    - `paginated_world` — full world item list (spaces + DMs). Must use PBLite JSON, not binary protobuf.
+    - `list_topics` — reliable cursor pagination (matching the web client).
 
 For large exports, prefer `GoogleChatClient.fetchTopicsWithServerPagination()` and `utils.exportChatBatches()`.
 
@@ -114,7 +116,7 @@ Getting messages from a space:
 
 ```
 1. `GoogleChatClient.listSpaces()`
-   └─▶ POST /api/paginated_world (protobuf)
+   └─▶ POST /api/paginated_world (JSON/PBLite)
    └─▶ Parse → Space[]
 
 2. `GoogleChatClient.getThreads(spaceId, …)`

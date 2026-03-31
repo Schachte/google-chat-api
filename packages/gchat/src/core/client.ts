@@ -1,4 +1,6 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { basename, extname } from 'node:path';
 import {
   authenticateWithCookies,
   buildCookieString,
@@ -9,6 +11,7 @@ import {
   type AuthResult,
 } from './auth.js';
 import { type ExtensionBridge } from './extension-bridge.js';
+import { type ProxyBridge } from './proxy-bridge.js';
 import {
   AnnotationType,
   PresenceStatus,
@@ -46,6 +49,13 @@ import {
   type CardSection,
   type CardWidget,
   type CardButton,
+  type NotificationOptions,
+  type NotificationResult,
+  type RefreshUnreadsResult,
+  type MarkAllAsReadResult,
+  type AttachmentBinaryResult,
+  type DMPresenceEntry,
+  type DMPresenceResult,
 } from './types.js';
 import { log } from './logger.js';
 import {
@@ -56,6 +66,7 @@ import {
   encodeGetSelfUserStatusRequest,
   encodeCreateTopicRequest,
   encodeCreateMessageRequest,
+  type UploadAnnotationOptions,
   encodeGetUserPresenceRequest,
   encodeMarkGroupReadstateRequest,
   encodeGetGroupRequest,
@@ -80,10 +91,19 @@ export class GoogleChatClient {
   private cacheDir: string;
   private selfUserId?: string;
   private _debugLoggedCreator = false;
-  /** When set, all HTTP requests are proxied through the Chrome extension. */
-  private bridge: ExtensionBridge | null = null;
+  /** When set, all HTTP requests are proxied through the Chrome extension or CF Services Auth Proxy. */
+  private bridge: ExtensionBridge | ProxyBridge | null = null;
 
-  constructor(cookies: Cookies, cacheDir = '.', bridge: ExtensionBridge | null = null) {
+  /**
+   * Cache of recently-marked thread IDs.  After mark_topic_readstate succeeds
+   * the thread IS read on Google's servers, but paginated_world's readState[20]
+   * boolean can lag behind.  We suppress the stale indicator here for up to
+   * MARK_CACHE_TTL_MS after a successful mark.
+   */
+  private markedThreads = new Map<string, number>(); // key: "spaceId/topicId", value: Date.now()
+  private static readonly MARK_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
+  constructor(cookies: Cookies, cacheDir = '.', bridge: ExtensionBridge | ProxyBridge | null = null) {
     this.cookies = cookies;
     this.cacheDir = cacheDir;
     this.bridge   = bridge;
@@ -111,6 +131,42 @@ export class GoogleChatClient {
     this.auth = await authenticateWithExtension({ tokenTimeoutMs });
   }
 
+  /**
+   * Authenticate via the CF Services Auth Proxy.
+   * The proxy handles cookies and XSRF token injection — we just verify
+   * the proxy is healthy and the XSRF token has been captured.
+   */
+  async authenticateWithProxy(tokenTimeoutMs = 30_000): Promise<void> {
+    if (!this.bridge || !('isProxy' in this.bridge)) {
+      throw new Error(
+        'authenticateWithProxy() called but no ProxyBridge was provided to GoogleChatClient.'
+      );
+    }
+    const proxyBridge = this.bridge as import('./proxy-bridge.js').ProxyBridge;
+    await proxyBridge.waitForToken(tokenTimeoutMs);
+    // Set a minimal auth result — the proxy handles the real XSRF token
+    this.auth = {
+      cookies: {},
+      xsrfToken: 'proxy-managed',
+      cookieString: '',
+    };
+  }
+
+  /**
+   * Ensure the client is authenticated, using the correct strategy
+   * depending on whether a browser extension bridge is present.
+   */
+  private async ensureAuth(forceRefresh = false): Promise<void> {
+    if (this.auth && !forceRefresh) return;
+    if (this.bridge && 'isProxy' in this.bridge) {
+      await this.authenticateWithProxy();
+    } else if (this.bridge) {
+      await this.authenticateWithExtension();
+    } else {
+      await this.authenticate(forceRefresh);
+    }
+  }
+
   getCookieString(): string {
     if (!this.auth) {
       throw new Error('Client not authenticated. Call authenticate() first.');
@@ -133,7 +189,7 @@ export class GoogleChatClient {
 
     if (!response.ok && (response.status === 401 || response.status === 403)) {
       try {
-        await this.authenticate(true);
+        await this.ensureAuth(true);
       } catch {
       }
       response = await doFetch();
@@ -149,9 +205,7 @@ export class GoogleChatClient {
     extraHeaders?: Record<string, string>
   ): Promise<Response> {
     const url = endpoint.startsWith('http') ? endpoint : `${API_BASE}${endpoint}`;
-    if (!this.auth) {
-      await this.authenticate();
-    }
+    await this.ensureAuth();
 
     if (this.bridge) {
       const headers: Record<string, string> = {
@@ -188,9 +242,7 @@ export class GoogleChatClient {
   }
 
   async proxyFetch(url: string): Promise<Response> {
-    if (!this.auth) {
-      await this.authenticate();
-    }
+    await this.ensureAuth();
 
     if (this.bridge) {
       const headers: Record<string, string> = { 'User-Agent': USER_AGENT };
@@ -211,9 +263,7 @@ export class GoogleChatClient {
   }
 
   async getAttachmentUrl(attachmentToken: string): Promise<string | null> {
-    if (!this.auth) {
-      await this.authenticate();
-    }
+    await this.ensureAuth();
 
     log.client.debug('getAttachmentUrl: Attempting to resolve token:', attachmentToken.slice(0, 50) + '...');
 
@@ -315,13 +365,27 @@ export class GoogleChatClient {
   }
 
   private async apiRequest<T = unknown>(endpoint: string, protoData: Uint8Array): Promise<T> {
-    if (!this.auth) {
-      await this.authenticate();
-    }
+    return this.apiRequestWithChannel<T>(endpoint, protoData);
+  }
+
+  /**
+   * Make an API request with an optional `?c=` channel parameter.
+   * Google Chat's paginated_world uses different channel IDs to return
+   * different sections of the world data.
+   */
+  private async apiRequestWithChannel<T = unknown>(
+    endpoint: string,
+    protoData: Uint8Array,
+    channelId?: number,
+  ): Promise<T> {
+    await this.ensureAuth();
 
     const url = new URL(`${API_BASE}/api/${endpoint}`);
     url.searchParams.set('alt', 'protojson');
     url.searchParams.set('key', API_KEY);
+    if (channelId !== undefined) {
+      url.searchParams.set('c', String(channelId));
+    }
 
     let response: Response;
 
@@ -332,6 +396,8 @@ export class GoogleChatClient {
         'Connection': 'Keep-Alive',
         'x-framework-xsrf-token': this.auth!.xsrfToken,
       };
+      // ProxyBridge: send protobuf as base64-encoded body with bodyEncoding hint.
+      // ExtensionBridge: sends Uint8Array directly (it handles base64 internally).
       const result = await this.bridge.proxyRequest(url.toString(), 'POST', headers, protoData);
       response = new Response(result.body, { status: result.status });
     } else {
@@ -353,7 +419,11 @@ export class GoogleChatClient {
       throw new Error(`API request failed: ${response.status} ${response.statusText} - ${text.slice(0, 200)}`);
     }
 
-    return this.parseXssiJson<T>(await response.text());
+    const responseText = await response.text();
+    if (endpoint === 'paginated_world') {
+      log.client.debug(`apiRequest(${endpoint}${channelId !== undefined ? `?c=${channelId}` : ''}): status=${response.status}, bodyLen=${responseText.length}`);
+    }
+    return this.parseXssiJson<T>(responseText);
   }
 
   private requestCounter = 1;
@@ -363,9 +433,7 @@ export class GoogleChatClient {
     payload: unknown[], 
     spaceId?: string
   ): Promise<T> {
-    if (!this.auth) {
-      await this.authenticate();
-    }
+    await this.ensureAuth();
 
     const url = new URL(`${API_BASE}/api/${endpoint}`);
     url.searchParams.set('c', String(this.requestCounter++));
@@ -412,6 +480,89 @@ export class GoogleChatClient {
       null, 2, 2, null, null, null, null, 2, 2, 2, 2, null, 2, null, null, 2,
       null, 2, 2, 2, 2, null, 2
     ]];
+  }
+
+  private buildMutationRequestHeader(): unknown[] {
+    return [0, 3, 1, 'en', [
+      null, null, null, null, 2, 2, null, 2, 2, 2, 2, null, null, null, null,
+      2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, null, null, 2, 2, null, null,
+      null, 2, 2, null, null, null, null, 2, 2, 2, 2, null, 2, null, null, 2,
+      null, 2, 2, 2, 2, null, 2, null, null, null, null, null, null, 2, 2,
+    ]];
+  }
+
+  /**
+   * Build a PBLite JSON payload for the paginated_world API.
+   * Matches the exact format Google Chat uses (Content-Type: application/json).
+   * Derived from captured browser requests.
+   */
+  private buildPaginatedWorldPayload(pageSize = 200): unknown[] {
+    const caps = [
+      null, null, null, null, 2, 2, null, 2, 2, 2, 2, null, null, null, null,
+      2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, null, null, 2, 2, null, null,
+      null, 2, 2, null, null, null, null, 2, 2, 2, 2, null, 2, null, null, 2,
+      null, 2, 2, 2, 2, null, 2, null, null, null, null, null, null, 2, 2,
+    ];
+    const header = [0, 3, 1, "en", caps];
+
+    // Section request templates — each requests a different "view" of the world.
+    // Structure: [pageSize, null, null, [filter...], ...flags...]
+    // These patterns are extracted from Google Chat's actual requests.
+    const s = (ps: number, filter: unknown[], ...rest: unknown[]) =>
+      [ps, null, null, filter, ...rest];
+
+    const sectionRequests: unknown[] = [
+      // Starred rooms (with snippet fetch)
+      s(pageSize, [null,null,null,null,null,null,null,null,null,null,null,1,null,null,null,[[3]]],
+        null,null,null,null, [null,[[1]],null,1], [[1,1],[1]], [1], null,null,null, [1]),
+      // Non-starred rooms (with snippet fetch)
+      s(pageSize, [null,null,null,null,null,null,4,null,null,null,null,1,null,null,[[5]],[[3]]],
+        null,null,null,null, [1,[[1],[2]],null,1], [[1,1],[1]], [1], null,null,null, [1]),
+      // Starred DM people
+      s(pageSize, [null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,1],
+        null,null,null,null, [null,[[1]],null,1], [[1,1],[1]], [1], null,null,null, [1]),
+      // Non-starred DM people
+      s(pageSize, [null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,1],
+        null,null,null,null, [1,[[1],[2]],null,1], [[1,1],[1]], [1], null,null,null, [1]),
+      // Starred DM bots
+      s(pageSize, [1], null,null,null,null, null,null, [3], null, 1),
+      // All DMs (various notification filter combos — covers unread/read/mentioned)
+      s(pageSize, [2,null,null,null,null,null,null,null,null,null,null,1], null,null,null,null, null,null, [5], null, 1),
+      s(pageSize, [2,null,null,null,null,null,null,null,null,null,null,2], null,null,null,null, null,null, [5], null, 1),
+      s(pageSize, [2,null,null,null,null,null,2,null,null,null,null,2], null,null,null,null, null,null, [5], null, 1),
+      s(pageSize, [2,null,null,null,null,null,2,null,null,null,null,1], null,null,null,null, null,null, [5], null, 1),
+      // Rooms with notification combos (follows+mentions, @mentions only, etc.)
+      s(pageSize, [1,1,2,null,null,2,null,null,1,null,null,null,null,null,null,[[4],[8]]], null,null,null,null, null,null, [3]),
+      s(pageSize, [1,1,2,null,null,2,2,null,1,null,null,null,null,null,null,[[4],[8]]], null,null,null,null, null,null, [3]),
+      s(pageSize, [1,1,2,null,2,1,null,null,null,null,null,null,null,null,[[8]],[[4]]], null,null,null,null, null,null, [3]),
+      s(pageSize, [1,1,2,null,2,1,2,null,null,null,null,null,null,null,[[8]],[[4]]], null,null,null,null, null,null, [3]),
+      s(pageSize, [1,1,2,null,1,null,null,2,2,null,null,null,null,null,null,[[4],[8]]], null,null,null,null, null,null, [3]),
+      s(pageSize, [1,1,2,null,1,null,2,2,2,null,null,null,null,null,null,[[4],[8]]], null,null,null,null, null,null, [3]),
+      // Non-starred spaces with notification combos
+      s(pageSize, [2,1,2,null,null,2,null,null,1,null,null,2,null,null,null,[[4],[8]]], null,null,null,null, null,null, [5]),
+      s(pageSize, [2,1,2,null,null,2,null,null,1,null,null,1,null,null,null,[[4],[8]]], null,null,null,null, null,null, [5]),
+      s(pageSize, [2,1,2,null,null,2,2,null,1,null,null,1,null,null,null,[[4],[8]]], null,null,null,null, null,null, [5]),
+      s(pageSize, [2,1,2,null,1,null,null,2,2,null,null,1,null,null,null,[[4],[8]]], null,null,null,null, null,null, [5]),
+      s(pageSize, [2,1,2,null,1,null,null,2,2,null,null,2,null,null,null,[[4],[8]]], null,null,null,null, null,null, [5]),
+      s(pageSize, [2,1,2,null,1,null,2,2,2,null,null,1,null,null,null,[[4],[8]]], null,null,null,null, null,null, [5]),
+      s(pageSize, [2,1,2,null,2,1,null,null,null,null,null,2,null,null,[[8]],[[4]]], null,null,null,null, null,null, [5]),
+      s(pageSize, [2,1,2,null,2,1,null,null,null,null,null,1,null,null,[[8]],[[4]]], null,null,null,null, null,null, [5]),
+      s(pageSize, [2,1,2,null,2,1,2,null,null,null,null,1,null,null,[[8]],[[4]]], null,null,null,null, null,null, [5]),
+      // Invite/presence sections
+      s(1, [null,null,null,null,null,2,null,null,null,null,[1]], null,null, 2),
+      s(1, [null,null,null,null,null,2,null,null,null,null,[2]], null,null, 2),
+    ];
+
+    return [
+      header,
+      sectionRequests,
+      null,                  // world_consistency_token
+      [4, 2, 5, 6, 7, 3],  // fetch_options
+      null, null, null, null,
+      1,                     // fetchFromUserSpaces
+      null,
+      1,                     // fetchSnippetsForUnnamedRooms
+    ];
   }
 
   private buildListTopicsPayload(
@@ -515,6 +666,24 @@ export class GoogleChatClient {
       return Number.isNaN(parsed) ? 0 : parsed;
     }
     return 0;
+  }
+
+  /**
+   * Like `toNumber` but returns `undefined` when the input is absent
+   * (null, undefined, or empty string) instead of collapsing to 0.
+   * This preserves the distinction between "server said 0" and
+   * "field was missing from the response", which matters for badge
+   * counts and read-watermark timestamps.
+   */
+  private toOptionalNumber(value: unknown): number | undefined {
+    if (value == null) return undefined;
+    if (typeof value === 'number') return Number.isNaN(value) ? undefined : value;
+    if (typeof value === 'string') {
+      if (value.length === 0) return undefined;
+      const parsed = Number(value);
+      return Number.isNaN(parsed) ? undefined : parsed;
+    }
+    return undefined;
   }
 
   private parseAnnotations(arr: unknown[]): Annotation[] {
@@ -888,14 +1057,40 @@ export class GoogleChatClient {
     return cards;
   }
 
-  private parseWorldItems(data: unknown): WorldItemSummary[] {
+  private parseWorldItems(data: unknown, traceLog?: (msg: string) => void): WorldItemSummary[] {
+    const t = traceLog ?? (() => {});
+
     const payload = Array.isArray(data) && data.length > 0 && Array.isArray(data[0])
       ? data[0]
       : data;
 
     const items = this.getPbliteField<unknown[]>(payload, 4);
     if (!Array.isArray(items)) {
+      // Debug: log structure of first few elements to understand the response format
+      if (Array.isArray(payload)) {
+        for (let i = 0; i < Math.min(payload.length, 6); i++) {
+          const el = payload[i];
+          const elType = el === null ? 'null' : Array.isArray(el) ? `array[${el.length}]` : typeof el;
+          const preview = typeof el === 'string' ? el.slice(0, 50) : '';
+          t(`parseWorldItems: payload[${i}] = ${elType}${preview ? ` "${preview}"` : ''}`);
+        }
+      }
+      t(`parseWorldItems: no items array found (payload isArray=${Array.isArray(payload)}, length=${Array.isArray(payload) ? payload.length : 'N/A'})`);
       return [];
+    }
+
+    t(`parseWorldItems: raw items array has ${items.length} entries`);
+
+    // Build userId→displayName map from payload field 8 (index 7 with tag offset).
+    // Structure: payload[7][n][1] = [[[ [userId], "Display Name", avatarUrl, email, ... ]]]
+    const userNameMap = this.extractUserNameMap(payload);
+    if (userNameMap.size > 0) {
+      t(`parseWorldItems: built user name map with ${userNameMap.size} users`);
+    }
+
+    const threadIdsBySpace = this.extractThreadIdsBySpace(payload);
+    if (threadIdsBySpace.size > 0) {
+      t(`parseWorldItems: built thread map for ${threadIdsBySpace.size} spaces`);
     }
 
     const results: WorldItemSummary[] = [];
@@ -914,37 +1109,135 @@ export class GoogleChatClient {
         continue;
       }
 
+      // Extract sortTimestamp (last activity time) from the item's group-ID sub-array.
+      // Same approach as parseSpacesWithTimestamp: scan positions 8-19 of the raw
+      // second element for a microsecond timestamp string, then fall back to field 3.
+      let sortTimestamp: number | undefined;
+      const spaceEntry = item[1];
+      if (Array.isArray(spaceEntry)) {
+        for (let si = 8; si < Math.min(spaceEntry.length, 20); si++) {
+          const val = spaceEntry[si];
+          if (typeof val === 'string' && /^\d{13,}$/.test(val)) {
+            sortTimestamp = parseInt(val, 10);
+            break;
+          }
+        }
+      }
+      if (!sortTimestamp) {
+        sortTimestamp = this.toOptionalNumber(this.getPbliteField(item, 3));
+      }
+
+      // readState = item[3] (getPbliteField 4) — the member/read state sub-array
+      // Contains badge count, read watermark, notification timestamps, notification level
       const readState = this.getPbliteField<unknown[]>(item, 4);
       const message = this.getPbliteField<unknown[]>(item, 13);
 
       const unreadCount = this.toNumber(this.getPbliteField(readState, 4));
-      const unreadSubscribedTopicCount = this.toNumber(
-        this.getPbliteField(readState, 7)
-      );
-      const lastMentionTime = this.toNumber(this.getPbliteField(message, 7)) || undefined;
+      let unreadSubscribedTopicCount = 0;
+      let subscribedThreadId: string | undefined;
+      const lastMentionTime = this.toOptionalNumber(this.getPbliteField(message, 7));
       const unreadReplyCount = this.toNumber(this.getPbliteField(message, 9));
       const lastMessageText = this.getPbliteField<string>(message, 10);
 
+      // Extract notification fields from readState (item[3]):
+      //   readState[1]  = read watermark timestamp (usec string)   → getPbliteField(readState, 2)
+      //   readState[6]  = badge count (string "0", "1", "4" etc.)  → getPbliteField(readState, 7)
+      //   readState[17] = pending notification timestamp (usec)    → getPbliteField(readState, 18)
+      //                    Non-zero when the item has unread content; 0 when fully read.
+      //                    For DMs this is the most reliable unread indicator because
+      //                    readState[1] gets updated aggressively by sidebar syncs.
+      //   readState[21] = notification level (3=follows, 4=@only)  → getPbliteField(readState, 22)
+      //   readState[27] = last notif-worthy event timestamp (usec) → getPbliteField(readState, 28)
+      let badgeCount: number | undefined;
+      let lastNotifWorthyEventTimestamp: number | undefined;
+      let readWatermarkTimestamp: number | undefined;
+      let notificationLevel: number | undefined;
+      let pendingNotificationTimestamp: number | undefined;
+
+      if (Array.isArray(readState)) {
+        const rawThreadUnreadState = this.getPbliteField<unknown[]>(readState, 21);
+        const rawBadge = this.getPbliteField(readState, 7);
+        const rawNotifEvent = this.getPbliteField(readState, 28);
+        const rawWatermark = this.getPbliteField(readState, 2);
+        const rawNotifLevel = this.getPbliteField(readState, 22);
+        const rawPendingNotif = this.getPbliteField(readState, 18);
+        // NOTE: readState[5] (getPbliteField 6) = last activity timestamp
+        // for the space.  The Google Chat UI compares this against the read
+        // watermark (readState[1]) to show the blue unread dot.  We handle
+        // this via markAsReadJson() in markThreadAsRead() rather than in
+        // categorizeNotification().  Kept as documentation of the field map.
+
+        badgeCount = this.toOptionalNumber(rawBadge);
+        lastNotifWorthyEventTimestamp = this.toOptionalNumber(rawNotifEvent);
+        readWatermarkTimestamp = this.toOptionalNumber(rawWatermark);
+        notificationLevel = this.toOptionalNumber(rawNotifLevel);
+        pendingNotificationTimestamp = this.toOptionalNumber(rawPendingNotif);
+
+        if (Array.isArray(rawThreadUnreadState)) {
+          let hasThreadUnread = this.getPbliteField<boolean>(rawThreadUnreadState, 2) === true;
+
+          const rawSubscribedThread = this.getPbliteField<unknown[]>(rawThreadUnreadState, 3);
+          if (Array.isArray(rawSubscribedThread)) {
+            subscribedThreadId = this.getPbliteField<string>(rawSubscribedThread, 2);
+          }
+
+          // Suppress stale readState[20] indicator for threads recently
+          // marked as read.  paginated_world can lag; mark_topic_readstate
+          // confirmed the thread is already read server-side.
+          if (hasThreadUnread && subscribedThreadId && this.isThreadRecentlyMarked(id, subscribedThreadId)) {
+            log.client.debug(`parseWorldItems: suppressing stale readState[20] for ${id}/${subscribedThreadId} (recently marked)`);
+            hasThreadUnread = false;
+          }
+
+          // readState[20] is a persistent flag that never naturally clears.
+          // If the space's read watermark has already been advanced past all
+          // activity (sortTimestamp <= readWatermarkTimestamp), any thread
+          // unread indicator is stale — the user has read past everything.
+          if (
+            hasThreadUnread &&
+            sortTimestamp != null &&
+            readWatermarkTimestamp != null &&
+            sortTimestamp <= readWatermarkTimestamp
+          ) {
+            log.client.debug(
+              `parseWorldItems: suppressing stale readState[20] for ${id} ` +
+              `(sortTimestamp ${sortTimestamp} <= readWatermark ${readWatermarkTimestamp})`
+            );
+            hasThreadUnread = false;
+          }
+
+          unreadSubscribedTopicCount = hasThreadUnread ? 1 : 0;
+        }
+      }
+
       const type = dmId ? 'dm' : 'space';
       const notificationCategory = this.categorizeNotification(
-        type,
-        unreadCount,
-        unreadSubscribedTopicCount > 0,
-        false 
+        badgeCount ?? 0,
+        lastNotifWorthyEventTimestamp,
+        readWatermarkTimestamp,
+        sortTimestamp,
+        pendingNotificationTimestamp,
       );
 
       let name = this.getPbliteField<string>(item, 5);
 
-      if (type === 'dm' && !name) {
-        name = this.getPbliteField<string>(item, 3);
+      // Extract DM member user IDs for name resolution
+      let memberUserIds: string[] | undefined;
+      if (type === 'dm') {
+        memberUserIds = this.extractDmMemberIds(item);
+      }
 
-        log.client.debug('parseWorldItems: DM item:', {
-          id,
-          field3: this.getPbliteField(item, 3),
-          field5: this.getPbliteField(item, 5),
-          itemLength: item.length,
-          firstFewFields: item.slice(0, 10).map((v, i) => `[${i}]: ${typeof v === 'string' ? v.slice(0, 30) : typeof v}`),
-        });
+      // For DMs, resolve name from member data
+      if (type === 'dm' && !name) {
+        // First try: item[2] (getPbliteField 3) may be a string name
+        const field3 = this.getPbliteField<unknown>(item, 3);
+        if (typeof field3 === 'string') {
+          name = field3;
+        }
+        // Second try: resolve from embedded member name map
+        if (!name && userNameMap.size > 0) {
+          name = this.resolveDmName(item, userNameMap);
+        }
       }
 
       results.push({
@@ -956,12 +1249,222 @@ export class GoogleChatClient {
         lastMentionTime,
         unreadReplyCount,
         lastMessageText,
+        subscribedThreadId,
+        threadIds: type === 'space'
+          ? this.mergeThreadIds(threadIdsBySpace.get(id), subscribedThreadId)
+          : undefined,
         isSubscribedToSpace: unreadSubscribedTopicCount > 0,
         notificationCategory,
+        badgeCount,
+        lastNotifWorthyEventTimestamp,
+        readWatermarkTimestamp,
+        notificationLevel,
+        sortTimestamp,
+        _memberUserIds: memberUserIds,
       });
     }
 
+    if (results.length > 0) {
+      const badged = results.filter(r => r.notificationCategory === 'badged').length;
+      const litUp = results.filter(r => r.notificationCategory === 'lit_up').length;
+      const dmsNamed = results.filter(r => r.type === 'dm' && r.name).length;
+      const dmsTotal = results.filter(r => r.type === 'dm').length;
+      log.client.debug(
+        `parseWorldItems: ${results.length} items — badged=${badged}, lit_up=${litUp}, clean=${results.length - badged - litUp}, dms=${dmsNamed}/${dmsTotal} named`
+      );
+    }
+
     return results;
+  }
+
+  private extractThreadIdsBySpace(payload: unknown): Map<string, string[]> {
+    const map = new Map<string, string[]>();
+    const threadSections = [
+      this.getPbliteField<unknown[]>(payload, 7),
+      this.getPbliteField<unknown[]>(payload, 8),
+    ];
+
+    for (const threadSection of threadSections) {
+      if (!Array.isArray(threadSection)) {
+        continue;
+      }
+
+      for (const entry of threadSection) {
+        if (!Array.isArray(entry)) {
+          continue;
+        }
+
+        const meta = this.getPbliteField<unknown[]>(entry, 1);
+        const threadRef = this.getPbliteField<unknown[]>(meta, 1);
+        const threadId = this.getPbliteField<string>(threadRef, 2);
+        const spaceWrapper = this.getPbliteField<unknown[]>(threadRef, 3);
+        const spaceId = this.getNestedPbliteString(spaceWrapper, 1, 1);
+
+        if (!threadId || !spaceId) {
+          continue;
+        }
+
+        const existing = map.get(spaceId);
+        if (existing) {
+          if (!existing.includes(threadId)) {
+            existing.push(threadId);
+          }
+        } else {
+          map.set(spaceId, [threadId]);
+        }
+      }
+    }
+
+    return map;
+  }
+
+  /**
+   * Merge threadIds from extractThreadIdsBySpace (pw[7]/pw[8]) with the
+   * subscribedThreadId from readState[20].  The subscribed thread is the
+   * actual unread thread and is often NOT present in pw[7]/pw[8].
+   */
+  private mergeThreadIds(
+    existing: string[] | undefined,
+    subscribedThreadId: string | undefined,
+  ): string[] | undefined {
+    if (!subscribedThreadId) {
+      return existing;
+    }
+
+    if (!existing || existing.length === 0) {
+      return [subscribedThreadId];
+    }
+
+    if (existing.includes(subscribedThreadId)) {
+      return existing;
+    }
+
+    // Put the subscribed (unread) thread first so it gets cleared first
+    return [subscribedThreadId, ...existing];
+  }
+
+  /** Check if a thread was recently marked as read (suppresses stale readState[20]). */
+  private isThreadRecentlyMarked(spaceId: string, topicId: string): boolean {
+    const key = `${spaceId}/${topicId}`;
+    const ts = this.markedThreads.get(key);
+    if (ts == null) return false;
+    if (Date.now() - ts > GoogleChatClient.MARK_CACHE_TTL_MS) {
+      this.markedThreads.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  /** Evict expired entries from the marked-threads cache. */
+  private pruneMarkedThreadsCache(): void {
+    const now = Date.now();
+    for (const [key, ts] of this.markedThreads) {
+      if (now - ts > GoogleChatClient.MARK_CACHE_TTL_MS) {
+        this.markedThreads.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Extract a userId→displayName map from the PBLite payload's member section.
+   * payload field 8 (index varies by tag offset) contains thread-level member
+   * data: payload[7][n][1] = [[[ [userId], "Name", avatarUrl, email, ... ]]]
+   */
+  private extractUserNameMap(payload: unknown): Map<string, string> {
+    const map = new Map<string, string>();
+    const memberSection = this.getPbliteField<unknown[]>(payload, 8);
+    if (!Array.isArray(memberSection)) return map;
+
+    for (const entry of memberSection) {
+      if (!Array.isArray(entry) || entry.length < 2) continue;
+      const userInfoWrapper = entry[1]; // [[[userData]]]
+      if (!Array.isArray(userInfoWrapper)) continue;
+
+      for (const level1 of userInfoWrapper) {
+        if (!Array.isArray(level1)) continue;
+        for (const userData of level1) {
+          if (!Array.isArray(userData) || userData.length < 2) continue;
+          const uidArr = userData[0];
+          const displayName = userData[1];
+          if (
+            Array.isArray(uidArr) &&
+            uidArr.length > 0 &&
+            typeof uidArr[0] === 'string' &&
+            typeof displayName === 'string'
+          ) {
+            if (!map.has(uidArr[0])) {
+              map.set(uidArr[0], displayName);
+            }
+          }
+        }
+      }
+    }
+
+    return map;
+  }
+
+  /**
+   * Resolve a DM's display name by looking up the "other" participant(s)
+   * in the user name map.  item[5][0] contains member ID arrays:
+   *   [[userId1], [userId2], ...]
+   * We exclude selfUserId and join the remaining names.
+   */
+  private resolveDmName(item: unknown[], userNameMap: Map<string, string>): string | undefined {
+    const membersField = this.getPbliteField<unknown[]>(item, 6); // item[5]
+    if (!Array.isArray(membersField) || membersField.length === 0) return undefined;
+
+    const memberIdArrays = membersField[0];
+    if (!Array.isArray(memberIdArrays)) return undefined;
+
+    // Detect self user ID from item[6] (getPbliteField 7) if not already known.
+    // For DMs, item[6][0] = [currentUserId] consistently.
+    let selfId = this.selfUserId;
+    if (!selfId) {
+      const actorField = this.getPbliteField<unknown[]>(item, 7); // item[6]
+      if (Array.isArray(actorField) && actorField.length > 0) {
+        const actorIdArr = actorField[0];
+        if (Array.isArray(actorIdArr) && actorIdArr.length > 0 && typeof actorIdArr[0] === 'string') {
+          selfId = actorIdArr[0];
+        } else if (typeof actorIdArr === 'string') {
+          selfId = actorIdArr;
+        }
+      }
+    }
+
+    const otherNames: string[] = [];
+    for (const m of memberIdArrays) {
+      if (!Array.isArray(m) || m.length === 0 || typeof m[0] !== 'string') continue;
+      const uid = m[0];
+      // Skip self
+      if (selfId && uid === selfId) continue;
+      const name = userNameMap.get(uid);
+      if (name) otherNames.push(name);
+    }
+
+    if (otherNames.length > 0) {
+      return otherNames.join(', ');
+    }
+    return undefined;
+  }
+
+  /**
+   * Extract participant user IDs from a DM PBLite item.
+   * item[5] (getPbliteField 6) = [[userId1], [userId2], ...] at sub-index 0.
+   */
+  private extractDmMemberIds(item: unknown[]): string[] | undefined {
+    const membersField = this.getPbliteField<unknown[]>(item, 6);
+    if (!Array.isArray(membersField) || membersField.length === 0) return undefined;
+
+    const memberIdArrays = membersField[0];
+    if (!Array.isArray(memberIdArrays)) return undefined;
+
+    const ids: string[] = [];
+    for (const m of memberIdArrays) {
+      if (Array.isArray(m) && m.length > 0 && typeof m[0] === 'string') {
+        ids.push(m[0]);
+      }
+    }
+    return ids.length > 0 ? ids : undefined;
   }
 
   private parseMemberNames(data: unknown): Record<string, string> {
@@ -971,12 +1474,6 @@ export class GoogleChatClient {
 
     const members = this.getPbliteField<unknown[]>(payload, 1);
     const names: Record<string, string> = {};
-
-    log.client.debug('parseMemberNames: Raw data:', JSON.stringify(data, null, 2).slice(0, 1000));
-    if (Array.isArray(payload) && payload.length > 0) {
-      log.client.debug('parseMemberNames: Payload structure - length:', payload.length, 'first item type:', typeof payload[0], Array.isArray(payload[0]) ? 'array len ' + (payload[0] as unknown[]).length : '');
-    }
-    log.client.debug('parseMemberNames: members array:', members ? (Array.isArray(members) ? 'array length ' + members.length : typeof members) : 'null/undefined');
 
     if (!Array.isArray(members)) {
       if (Array.isArray(payload)) {
@@ -1183,6 +1680,30 @@ export class GoogleChatClient {
       log.client.debug('listSpaces: catch_up_user failed:', (e as Error).message);
     }
 
+    // If protobuf + catchUpUser returned nothing (common in extension auth mode),
+    // fall back to JSON API which works reliably through the extension bridge.
+    if (spaces.length === 0) {
+      log.client.debug('listSpaces: protobuf returned no spaces, falling back to JSON API...');
+      try {
+        const payload = this.buildPaginatedWorldPayload(pageSize);
+        const jsonData = await this.apiRequestJson<unknown[]>('paginated_world', payload);
+        const worldItems = this.parseWorldItems(jsonData);
+        for (const item of worldItems) {
+          if (!seenIds.has(item.id)) {
+            seenIds.add(item.id);
+            spaces.push({
+              id: item.id,
+              name: item.name,
+              type: item.type,
+            });
+          }
+        }
+        log.client.debug(`listSpaces: JSON API fallback returned ${spaces.length} spaces`);
+      } catch (jsonErr) {
+        log.client.debug('listSpaces: JSON API fallback failed:', (jsonErr as Error).message);
+      }
+    }
+
     log.client.debug('listSpaces: Total spaces found:', spaces.length);
     return spaces;
   }
@@ -1309,15 +1830,59 @@ export class GoogleChatClient {
         }
       }
 
+      // If protobuf returned nothing, fall back to JSON API
+      if (spaces.length === 0) {
+        log.client.debug('listSpacesPaginated: protobuf returned no spaces, falling back to JSON API...');
+        try {
+          const payload = this.buildPaginatedWorldPayload(pageSize);
+          const jsonData = await this.apiRequestJson<unknown[]>('paginated_world', payload);
+          const worldItems = this.parseWorldItems(jsonData);
+          for (const item of worldItems) {
+            if (!seenIds.has(item.id)) {
+              seenIds.add(item.id);
+              spaces.push({
+                id: item.id,
+                name: item.name,
+                type: item.type,
+              });
+            }
+          }
+          log.client.debug(`listSpacesPaginated: JSON API fallback returned ${spaces.length} spaces`);
+        } catch (jsonErr) {
+          log.client.debug('listSpacesPaginated: JSON API fallback failed:', (jsonErr as Error).message);
+        }
+      }
+
       return {
         spaces,
         pagination: {
-          hasMore,
+          hasMore: spaces.length >= pageSize,
           nextCursor,
         },
       };
     } catch (e) {
       log.client.error('listSpacesPaginated: API call failed:', e);
+
+      // Last resort: try JSON API even if protobuf threw
+      try {
+        log.client.debug('listSpacesPaginated: trying JSON API after protobuf error...');
+        const payload = this.buildPaginatedWorldPayload(pageSize);
+        const jsonData = await this.apiRequestJson<unknown[]>('paginated_world', payload);
+        const worldItems = this.parseWorldItems(jsonData);
+        for (const item of worldItems) {
+          if (!seenIds.has(item.id)) {
+            seenIds.add(item.id);
+            spaces.push({
+              id: item.id,
+              name: item.name,
+              type: item.type,
+            });
+          }
+        }
+      } catch (jsonErr) {
+        log.client.debug('listSpacesPaginated: JSON API fallback also failed:', (jsonErr as Error).message);
+      }
+
       return {
         spaces,
         pagination: { hasMore: false },
@@ -1363,7 +1928,7 @@ export class GoogleChatClient {
         }
       }
       if (!sortTimestamp) {
-        sortTimestamp = this.toNumber(this.getPbliteField(item, 3)) || undefined;
+        sortTimestamp = this.toOptionalNumber(this.getPbliteField(item, 3));
       }
 
       let name = this.getPbliteField<string>(item, 5);
@@ -1462,7 +2027,12 @@ export class GoogleChatClient {
         const protoData = encodePaginatedWorldRequest(pageSize, cursor);
         const data = await this.apiRequest<unknown[]>('paginated_world', protoData);
 
-        const parsedSpaces = this.parseSpacesWithTimestamp(data, true);
+        let parsedSpaces = this.parseSpacesWithTimestamp(data, true);
+        if (parsedSpaces.length === 0) {
+          // Fallback: try the non-enriched parser (different PBLite layout)
+          const fallbackSpaces = this.parseSpaces(data);
+          parsedSpaces = fallbackSpaces.map(s => ({ ...s, sortTimestamp: undefined }));
+        }
 
         let newCount = 0;
         for (const space of parsedSpaces) {
@@ -1497,6 +2067,48 @@ export class GoogleChatClient {
       } catch (e) {
         log.client.error('listSpacesEnriched: API call failed:', e);
         break;
+      }
+    }
+
+    // Fallback: if protobuf path returned nothing, try the JSON API path
+    // which fetchWorldItems uses (known to work in extension mode)
+    if (spaces.length === 0) {
+      log.client.debug('listSpacesEnriched: protobuf returned no spaces, falling back to JSON API...');
+      try {
+        const payload = this.buildPaginatedWorldPayload(pageSize);
+        const jsonData = await this.apiRequestJson<unknown[]>('paginated_world', payload);
+        const worldItems = this.parseWorldItems(jsonData);
+        for (const item of worldItems) {
+          if (!seenIds.has(item.id)) {
+            seenIds.add(item.id);
+            spaces.push({
+              id: item.id,
+              name: item.name,
+              type: item.type,
+            });
+          }
+        }
+        log.client.debug(`listSpacesEnriched: JSON API fallback returned ${spaces.length} spaces`);
+      } catch (e) {
+        log.client.debug('listSpacesEnriched: JSON API fallback failed:', (e as Error).message);
+      }
+    }
+
+    // Fallback: catch_up_user for any remaining spaces
+    if (spaces.length === 0) {
+      try {
+        const catchUpSpaces = await this.catchUpUser();
+        for (const space of catchUpSpaces) {
+          if (!seenIds.has(space.id)) {
+            seenIds.add(space.id);
+            spaces.push(space);
+          }
+        }
+        if (catchUpSpaces.length > 0) {
+          log.client.debug('listSpacesEnriched: catch_up_user returned', catchUpSpaces.length, 'spaces');
+        }
+      } catch (e) {
+        log.client.debug('listSpacesEnriched: catch_up_user failed:', (e as Error).message);
       }
     }
 
@@ -1601,34 +2213,350 @@ export class GoogleChatClient {
       try {
         log.client.debug('fetchWorldItems: Force refreshing from /mole/world');
         const { xsrfToken, body } = await fetchXsrfToken(this.cookies);
-
         saveAuthCache(xsrfToken, body, this.cacheDir);
+      } catch (err) {
+        log.client.debug('fetchWorldItems: Failed to refresh /mole/world auth cache (expected in extension mode):', err);
+      }
+    }
 
-        const freshItems = this.extractWorldItemsFromMoleWorld(body);
-        if (freshItems.length > 0) {
-          return { items: freshItems, raw: [] };
+    // Strategy: paginated_world API is the PRIMARY source (supports pagination
+    // for complete results with verified notification fields). Falls back to
+    // /mole/world HTML extraction only if the API fails.
+    const traceLog = (msg: string) => { log.client.debug(msg); };
+
+    let items: WorldItemSummary[] = [];
+    let raw: unknown[] = [];
+    let source = 'none';
+
+    // Primary: paginated_world JSON API — Google Chat sends PBLite JSON (not protobuf)
+    // with Content-Type: application/json and a ?c= channel parameter.
+    // A single request with all section types returns the full world.
+    {
+      traceLog('fetchWorldItems: trying paginated_world JSON API (primary)...');
+      const PAGE_SIZE = 200;
+      const seenIds = new Set<string>();
+
+      try {
+        const payload = this.buildPaginatedWorldPayload(PAGE_SIZE);
+        traceLog(`paginated_world: sending JSON request (${JSON.stringify(payload).length} bytes)...`);
+        const pageRaw = await this.apiRequestJson<unknown[]>('paginated_world', payload);
+
+        raw = pageRaw;
+        const pageItems = this.parseWorldItems(pageRaw, traceLog);
+
+        for (const item of pageItems) {
+          if (!seenIds.has(item.id)) {
+            seenIds.add(item.id);
+            items.push(item);
+          }
+        }
+        traceLog(`paginated_world JSON: ${pageItems.length} items (${items.length} unique)`);
+
+        if (items.length > 0) {
+          source = 'paginated_world';
         }
       } catch (err) {
-        log.client.error('fetchWorldItems: Failed to refresh from /mole/world:', err);
+        traceLog(`paginated_world JSON FAILED: ${err}`);
       }
     }
 
-    const authCache = loadAuthCache(this.cacheDir);
-    if (authCache?.mole_world_body) {
-      const moleWorldItems = this.extractWorldItemsFromMoleWorld(authCache.mole_world_body);
-      if (moleWorldItems.length > 0) {
-        return { items: moleWorldItems, raw: [] };
+    // Fallback: /mole/world HTML extraction (only if paginated_world returned nothing)
+    if (items.length === 0) {
+      traceLog('fetchWorldItems: paginated_world returned nothing, falling back to /mole/world HTML...');
+      let moleBody: string | null = null;
+
+      if (this.bridge) {
+        traceLog('fetchWorldItems: fetching /mole/world via bridge...');
+        try {
+          const moleUrl = 'https://chat.google.com/u/0/mole/world?origin=https://mail.google.com&shell=9&hl=en&wfi=gtn-roster-iframe-id&hs=' + encodeURIComponent('["h_hs",null,null,[1,0],null,null,"gmail.pinto-server_20230730.06_p0",1,null,[15,38,36,35,26,30,41,18,24,11,21,14,6],null,null,"3Mu86PSulM4.en..es5",0,null,null,[0]]');
+          const result = await this.bridge.proxyRequest(moleUrl, 'GET', {
+            'User-Agent': USER_AGENT,
+          });
+          if (result.status === 200 && result.body) {
+            moleBody = result.body;
+            // Debug: count dfe.w.pw occurrences and dump body for analysis
+            const dfePwCount = (moleBody.match(/dfe\.w\.pw/g) || []).length;
+            const afCallbackCount = (moleBody.match(/AF_initDataCallback/g) || []).length;
+            traceLog(`/mole/world fetched OK, body length: ${moleBody.length}, dfe.w.pw count: ${dfePwCount}, AF_initDataCallback count: ${afCallbackCount}`);
+            try {
+              const { writeFileSync } = await import('node:fs');
+              writeFileSync('/tmp/gchat-moleworld.html', moleBody);
+              traceLog('Wrote /mole/world body to /tmp/gchat-moleworld.html');
+            } catch {}
+          } else {
+            traceLog(`/mole/world fetch failed: status=${result.status}`);
+          }
+        } catch (err) {
+          traceLog(`/mole/world bridge fetch error: ${err}`);
+        }
+      } else if (forceRefresh) {
+        try {
+          traceLog('fetchWorldItems: fetching /mole/world via cookies...');
+          const { xsrfToken, body } = await fetchXsrfToken(this.cookies);
+          saveAuthCache(xsrfToken, body, this.cacheDir);
+          moleBody = body;
+          traceLog(`/mole/world fetched OK, body length: ${moleBody.length}`);
+        } catch (err) {
+          traceLog(`/mole/world cookie fetch error: ${err}`);
+        }
+      }
+
+      if (!moleBody) {
+        const authCache = loadAuthCache(this.cacheDir);
+        if (authCache?.mole_world_body) {
+          moleBody = authCache.mole_world_body;
+          traceLog(`Using cached mole_world body, length: ${moleBody.length}`);
+        }
+      }
+
+      if (moleBody) {
+        const pbliteItems = this.extractPbliteWorldItems(moleBody, traceLog);
+        if (pbliteItems.length > 0) {
+          traceLog(`PBLite extraction from HTML: ${pbliteItems.length} items`);
+          items = pbliteItems;
+          source = 'mole_world_pblite';
+        }
+
+        if (items.length === 0) {
+          traceLog('PBLite extraction failed, falling back to DS:1...');
+          const ds1Items = this.extractWorldItemsFromMoleWorld(moleBody);
+          if (ds1Items.length > 0) {
+            traceLog(`DS:1 extraction: ${ds1Items.length} items`);
+            items = ds1Items;
+            source = 'mole_world_ds1';
+          }
+        }
       }
     }
 
-    const protoData = encodePaginatedWorldRequest(200);
-    const raw = await this.apiRequest<unknown[]>('paginated_world', protoData);
-    return { items: this.parseWorldItems(raw), raw };
+    if (items.length === 0) {
+      traceLog('No items from any source, returning empty');
+      return { items: [], raw: [] };
+    }
+
+    const dmCount = items.filter(i => i.type === 'dm').length;
+    const spaceCount = items.filter(i => i.type === 'space').length;
+    log.client.info(`fetchWorldItems: ${items.length} items (${spaceCount} spaces, ${dmCount} DMs) from ${source}`);
+
+    // Enrich unnamed DMs by resolving member user IDs to display names
+    await this.enrichDmNames(items, traceLog);
+
+    // Strip internal fields before returning
+    for (const item of items) {
+      delete item._memberUserIds;
+    }
+
+    return { items, raw };
+  }
+
+  /**
+   * Resolve display names for unnamed DMs by calling the get_members API.
+   * Collects all unique "other" user IDs from DMs that have _memberUserIds
+   * but no name, batch-fetches their profiles, and fills in names.
+   */
+  private async enrichDmNames(
+    items: WorldItemSummary[],
+    traceLog: (msg: string) => void,
+  ): Promise<void> {
+    const unnamedDms = items.filter(i => i.type === 'dm' && !i.name && i._memberUserIds?.length);
+    if (unnamedDms.length === 0) return;
+
+    // Collect all user IDs that need resolving (exclude self)
+    const selfId = this.selfUserId;
+    const userIdsToResolve = new Set<string>();
+    for (const dm of unnamedDms) {
+      for (const uid of dm._memberUserIds!) {
+        if (selfId && uid === selfId) continue;
+        userIdsToResolve.add(uid);
+      }
+    }
+
+    if (userIdsToResolve.size === 0) return;
+
+    traceLog(`enrichDmNames: resolving ${userIdsToResolve.size} user IDs for ${unnamedDms.length} unnamed DMs`);
+
+    // Batch-fetch member profiles
+    const nameMap = new Map<string, string>();
+    const uidArray = Array.from(userIdsToResolve);
+    const BATCH_SIZE = 50;
+
+    for (let i = 0; i < uidArray.length; i += BATCH_SIZE) {
+      const batch = uidArray.slice(i, i + BATCH_SIZE);
+      try {
+        const data = await this.apiRequest<unknown[]>(
+          'get_members', encodeGetMembersRequest(batch)
+        );
+        const names = this.parseMemberNames(data);
+        for (const [uid, displayName] of Object.entries(names)) {
+          nameMap.set(uid, displayName);
+        }
+      } catch (err) {
+        traceLog(`enrichDmNames: get_members batch failed: ${err}`);
+      }
+    }
+
+    if (nameMap.size === 0) {
+      traceLog('enrichDmNames: no names resolved');
+      return;
+    }
+
+    traceLog(`enrichDmNames: resolved ${nameMap.size} user names`);
+
+    // Apply names to unnamed DMs
+    for (const dm of unnamedDms) {
+      if (dm.name) continue;
+
+      // Detect self from member list if selfUserId not set
+      let detectedSelf = selfId;
+      if (!detectedSelf && dm._memberUserIds && dm._memberUserIds.length > 1) {
+        // The user ID that appears most across all DMs is likely self.
+        // Simpler heuristic: if only 2 members and we resolved one, the
+        // other is probably self.
+        for (const uid of dm._memberUserIds) {
+          if (!nameMap.has(uid) && !detectedSelf) {
+            // Couldn't resolve this one — might be self (self often not
+            // in get_members response). Only assume if we know nothing.
+          }
+        }
+      }
+
+      const otherNames: string[] = [];
+      for (const uid of dm._memberUserIds!) {
+        if (detectedSelf && uid === detectedSelf) continue;
+        const name = nameMap.get(uid);
+        if (name) otherNames.push(name);
+      }
+
+      if (otherNames.length > 0) {
+        dm.name = otherNames.join(', ');
+      }
+    }
   }
 
   async listWorldItems(options: { forceRefresh?: boolean } = {}): Promise<WorldItemSummary[]> {
     const { items } = await this.fetchWorldItems(options);
     return items;
+  }
+
+  /**
+   * Search /mole/world HTML for PBLite-tagged data (dfe.w.pw arrays).
+   *
+   * The paginated_world API returns PBLite with a dfe.w.pw tag containing
+   * verified notification fields.  The /mole/world HTML embeds data in
+   * AF_initDataCallback blocks — most are DS:1 format, but some Google
+   * builds inline PBLite-style arrays.  This method looks for any such
+   * array and, if found, feeds it to parseWorldItems() which already
+   * handles the verified field layout.
+   */
+  private extractPbliteWorldItems(
+    body: string,
+    traceLog: (msg: string) => void,
+  ): WorldItemSummary[] {
+    // Strategy 1: Scan every AF_initDataCallback block for an array whose
+    //             first element is the "dfe.w.pw" string tag.
+    const cbRegex =
+      /AF_initDataCallback\s*\(\s*\{[^}]*?data:\s*(\[[\s\S]*?\])\s*,\s*sideChannel/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = cbRegex.exec(body)) !== null) {
+      try {
+        const data = JSON.parse(match[1]);
+        const items = this.findAndParsePbliteWorld(data, traceLog);
+        if (items && items.length > 0) {
+          return items;
+        }
+      } catch {
+        // JSON parse failures are expected for non-matching blocks
+      }
+    }
+
+    // Strategy 2: Look for a raw [["dfe.w.pw", ...]] literal anywhere in
+    //             the HTML (e.g. in a <script> tag or global assignment).
+    const rawIdx = body.indexOf('"dfe.w.pw"');
+    if (rawIdx !== -1) {
+      // Walk backwards to find the opening '[['
+      let start = rawIdx;
+      for (let i = rawIdx - 1; i >= Math.max(0, rawIdx - 5); i--) {
+        if (body[i] === '[') {
+          start = i;
+        } else if (body[i] !== '[') {
+          break;
+        }
+      }
+
+      // Find the matching close — use a bracket counter
+      if (body[start] === '[') {
+        let depth = 0;
+        let end = start;
+        for (let i = start; i < body.length && i < start + 2_000_000; i++) {
+          if (body[i] === '[') depth++;
+          else if (body[i] === ']') {
+            depth--;
+            if (depth === 0) {
+              end = i + 1;
+              break;
+            }
+          }
+        }
+
+        if (end > start) {
+          try {
+            const data = JSON.parse(body.slice(start, end));
+            const items = this.findAndParsePbliteWorld(data, traceLog);
+            if (items && items.length > 0) {
+              return items;
+            }
+          } catch {
+            traceLog('extractPbliteWorldItems: raw dfe.w.pw JSON parse failed');
+          }
+        }
+      }
+    }
+
+    traceLog('extractPbliteWorldItems: no dfe.w.pw data found in HTML');
+    return [];
+  }
+
+  /**
+   * Recursively search a parsed JSON structure for a dfe.w.pw-tagged
+   * PBLite array and feed it to parseWorldItems().  Returns the parsed
+   * items or null if the tag isn't found.
+   */
+  private findAndParsePbliteWorld(
+    data: unknown,
+    traceLog: (msg: string) => void,
+    depth = 0,
+  ): WorldItemSummary[] | null {
+    if (depth > 10 || !Array.isArray(data)) return null;
+
+    // Direct match: data is [["dfe.w.pw", ...], ...]
+    if (
+      data.length > 0 &&
+      Array.isArray(data[0]) &&
+      data[0][0] === 'dfe.w.pw'
+    ) {
+      traceLog(`findAndParsePbliteWorld: found dfe.w.pw tag at depth ${depth}`);
+      // data is the top-level wrapper — parseWorldItems expects this shape
+      const items = this.parseWorldItems(data, traceLog);
+      if (items.length > 0) return items;
+    }
+
+    // data itself is ["dfe.w.pw", ...]
+    if (data[0] === 'dfe.w.pw') {
+      traceLog(`findAndParsePbliteWorld: data IS dfe.w.pw payload at depth ${depth}`);
+      const items = this.parseWorldItems([data], traceLog);
+      if (items.length > 0) return items;
+    }
+
+    // Recurse into sub-arrays
+    for (const child of data) {
+      if (Array.isArray(child)) {
+        const result = this.findAndParsePbliteWorld(child, traceLog, depth + 1);
+        if (result && result.length > 0) return result;
+      }
+    }
+
+    return null;
   }
 
   private extractWorldItemsFromMoleWorld(body: string): WorldItemSummary[] {
@@ -1699,11 +2627,17 @@ export class GoogleChatClient {
           subscribedThreadId = data[19][0];
         }
 
+        // DS:1 format: extract badge/notification fields at known positions
+        // NOTE: These DS:1 field mappings are speculative and not yet verified
+        // against the confirmed PBLite model. data[11] is used as badge count,
+        // data[7] as read watermark. Last notif-worthy event position is unknown.
+        const ds1BadgeCount = unreadCount1 > 0 ? unreadCount1 : undefined;
+        const ds1ReadWatermark = this.toOptionalNumber(data[7]);
+
         const notificationCategory = this.categorizeNotification(
-          'space',
-          hasUnreadFlag,
-          isSubscribedToSpace,
-          !!subscribedThreadId
+          ds1BadgeCount ?? 0,
+          undefined, // last notif-worthy event unknown in DS:1 format
+          ds1ReadWatermark,
         );
 
         items.push({
@@ -1717,6 +2651,8 @@ export class GoogleChatClient {
           subscribedThreadId,
           isSubscribedToSpace,
           notificationCategory,
+          badgeCount: ds1BadgeCount,
+          readWatermarkTimestamp: ds1ReadWatermark,
         });
       }
       return; 
@@ -1740,6 +2676,10 @@ export class GoogleChatClient {
 
         const unreadCount = actualUnreadCount > 0 ? actualUnreadCount : (hasUnreadFlag ? 1 : 0);
 
+        // DS:1 DM format — badge/watermark mappings are speculative
+        const dmBadgeCount = unreadCount > 0 ? unreadCount : undefined;
+        const dmReadWatermark = this.toOptionalNumber(data[7]);
+
         items.push({
           id: dmId,
           name: name ? this.decodeEscapedString(name) : undefined,
@@ -1749,7 +2689,13 @@ export class GoogleChatClient {
           lastMentionTime: mentionTimestamp,
           unreadReplyCount: 0, 
           isSubscribedToSpace: false,
-          notificationCategory: unreadCount > 0 ? 'direct_message' : 'none',
+          notificationCategory: this.categorizeNotification(
+            dmBadgeCount ?? 0,
+            undefined,
+            dmReadWatermark,
+          ),
+          badgeCount: dmBadgeCount,
+          readWatermarkTimestamp: dmReadWatermark,
         });
       }
       return; 
@@ -1773,6 +2719,10 @@ export class GoogleChatClient {
 
         const unreadCount = actualUnreadCount > 0 ? actualUnreadCount : (hasUnreadFlag ? 1 : 0);
 
+        // DS:1 alternate DM format — badge/watermark mappings are speculative
+        const dm2BadgeCount = unreadCount > 0 ? unreadCount : undefined;
+        const dm2ReadWatermark = this.toOptionalNumber(data[7]);
+
         items.push({
           id: dmId,
           name: undefined,
@@ -1782,7 +2732,13 @@ export class GoogleChatClient {
           lastMentionTime: mentionTimestamp,
           unreadReplyCount: 0, 
           isSubscribedToSpace: false,
-          notificationCategory: unreadCount > 0 ? 'direct_message' : 'none',
+          notificationCategory: this.categorizeNotification(
+            dm2BadgeCount ?? 0,
+            undefined,
+            dm2ReadWatermark,
+          ),
+          badgeCount: dm2BadgeCount,
+          readWatermarkTimestamp: dm2ReadWatermark,
         });
       }
       return;
@@ -1795,26 +2751,114 @@ export class GoogleChatClient {
     }
   }
 
+  /**
+   * Categorize notification state based on verified PBLite fields.
+   *
+   * Visual states in Google Chat UI:
+   * - 'badged': numbered badge indicator (readState[6] > "0")
+   * - 'lit_up': bold text, no number
+   * - 'none':   clean, no indicator
+   *
+   * Detection priority:
+   * 1. badgeCount > 0 → 'badged' (numbered badge)
+   * 2. pendingNotificationTimestamp > readWatermark → 'lit_up'
+   *    Some DMs keep a stale non-zero pending notification timestamp even after
+   *    they have been marked read. Treat it as unread only when it is newer than
+   *    the read watermark, or when no watermark is available.
+   * 3. lastNotifWorthyEvent > readWatermark → 'lit_up' (timestamp comparison)
+   * 4. sortTimestamp > readWatermark → 'lit_up' only when notif-worthy timestamp is absent
+   * 5. 'none' (fully read)
+   */
   private categorizeNotification(
-    type: 'space' | 'dm',
-    hasUnread: number,
-    isSubscribedToSpace: boolean,
-    hasSubscribedThread: boolean
+    badgeCount: number,
+    lastNotifWorthyEventTimestamp?: number,
+    readWatermarkTimestamp?: number,
+    sortTimestamp?: number,
+    pendingNotificationTimestamp?: number,
   ): import('./types.js').NotificationCategory {
-    if (type === 'dm') {
-      return hasUnread ? 'direct_message' : 'none';
+    if (badgeCount > 0) {
+      return 'badged';
     }
-
-    if (hasUnread && !hasSubscribedThread) {
-      return 'direct_mention';
+    if (pendingNotificationTimestamp != null && pendingNotificationTimestamp > 0) {
+      if (readWatermarkTimestamp == null || pendingNotificationTimestamp > readWatermarkTimestamp) {
+        return 'lit_up';
+      }
     }
-    if (hasSubscribedThread) {
-      return 'subscribed_thread';
+    if (
+      lastNotifWorthyEventTimestamp != null &&
+      readWatermarkTimestamp != null &&
+      lastNotifWorthyEventTimestamp > readWatermarkTimestamp
+    ) {
+      return 'lit_up';
     }
-    if (isSubscribedToSpace) {
-      return 'subscribed_space';
+    // Fallback: use sortTimestamp only when we do not have a notif-worthy timestamp.
+    if (
+      lastNotifWorthyEventTimestamp == null &&
+      sortTimestamp != null &&
+      readWatermarkTimestamp != null &&
+      sortTimestamp > readWatermarkTimestamp
+    ) {
+      return 'lit_up';
     }
     return 'none';
+  }
+
+  private isThreadUnreadSpace(item: WorldItemSummary): boolean {
+    return item.type === 'space'
+      && item.notificationCategory === 'none'
+      && (item.unreadSubscribedTopicCount > 0 || item.unreadReplyCount > 0);
+  }
+
+  private isUnreadItem(item: WorldItemSummary): boolean {
+    return item.notificationCategory !== 'none' || this.isThreadUnreadSpace(item);
+  }
+
+  private partitionNotificationItems(items: WorldItemSummary[]): {
+    badgedDMs: WorldItemSummary[];
+    badgedSpaces: WorldItemSummary[];
+    litupDMs: WorldItemSummary[];
+    litupSpaces: WorldItemSummary[];
+    threadUnreadSpaces: WorldItemSummary[];
+    readItems: WorldItemSummary[];
+  } {
+    const badgedDMs: WorldItemSummary[] = [];
+    const badgedSpaces: WorldItemSummary[] = [];
+    const litupDMs: WorldItemSummary[] = [];
+    const litupSpaces: WorldItemSummary[] = [];
+    const threadUnreadSpaces: WorldItemSummary[] = [];
+    const readItems: WorldItemSummary[] = [];
+
+    for (const item of items) {
+      if (item.type === 'dm') {
+        if (item.notificationCategory === 'badged') {
+          badgedDMs.push(item);
+        } else if (item.notificationCategory === 'lit_up') {
+          litupDMs.push(item);
+        } else {
+          readItems.push(item);
+        }
+        continue;
+      }
+
+      if (item.notificationCategory === 'badged') {
+        badgedSpaces.push(item);
+      } else if (item.notificationCategory === 'lit_up') {
+        litupSpaces.push(item);
+      } else if (this.isThreadUnreadSpace(item)) {
+        threadUnreadSpaces.push(item);
+      } else {
+        readItems.push(item);
+      }
+    }
+
+    return {
+      badgedDMs,
+      badgedSpaces,
+      litupDMs,
+      litupSpaces,
+      threadUnreadSpaces,
+      readItems,
+    };
   }
 
   private decodeEscapedString(value: string): string {
@@ -3467,7 +4511,7 @@ export class GoogleChatClient {
     let dmItems = items.filter(i => i.type === 'dm');
 
     if (unreadOnly) {
-      dmItems = dmItems.filter(i => i.unreadCount > 0);
+      dmItems = dmItems.filter(i => i.unreadCount > 0 || i.notificationCategory !== 'none');
     }
 
     const total = dmItems.length;
@@ -3551,7 +4595,7 @@ export class GoogleChatClient {
     let dmItems = items.filter(i => i.type === 'dm');
 
     if (unreadOnly) {
-      dmItems = dmItems.filter(i => i.unreadCount > 0);
+      dmItems = dmItems.filter(i => i.unreadCount > 0 || i.notificationCategory !== 'none');
     }
 
     const total = dmItems.length;
@@ -3654,27 +4698,383 @@ export class GoogleChatClient {
     }
   }
 
+  // ─── Image Upload ────────────────────────────────────────────────────────────
+
+  /**
+   * Upload an image to Google Chat using the raw upload protocol.
+   * Returns the attachment token needed for the UPLOAD_METADATA annotation.
+   *
+   * Uses a single-request upload via `upload_protocol=raw`, which sends
+   * the file data directly and returns a protobuf response containing the
+   * attachment token.
+   */
+  async uploadImage(
+    spaceId: string,
+    filePath: string,
+    localId: string,
+    topicId?: string,
+  ): Promise<{ attachmentToken: string }> {
+    await this.ensureAuth();
+
+    const fileData = readFileSync(filePath);
+    const fileName = basename(filePath);
+    const ext = extname(filePath).toLowerCase().replace('.', '');
+    const mimeMap: Record<string, string> = {
+      png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+      gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp',
+      svg: 'image/svg+xml',
+    };
+    const mimeType = mimeMap[ext] || 'application/octet-stream';
+
+    if (!this.bridge) {
+      throw new Error('Image upload requires a bridge (proxy or extension)');
+    }
+
+    const tid = topicId || localId;
+    const mid = localId;
+
+    // Single-request upload via raw protocol — no resumable session needed.
+    const uploadUrl = `${API_BASE}/uploads?group_id=${spaceId}&topic_id=${tid}` +
+      `&message_id=${mid}&otr=false&transcoded_video=false` +
+      `&upload_type=ATTACHMENT&original_content_type=undefined` +
+      `&upload_protocol=raw`;
+
+    const uploadHeaders: Record<string, string> = {
+      'chat-filename': encodeURIComponent(fileName),
+      'Content-Type': mimeType,
+      'x-goog-upload-header-content-type': mimeType,
+      'x-goog-upload-content-length': String(fileData.length),
+    };
+
+    const result = await this.bridge.proxyRequest(
+      uploadUrl, 'POST', uploadHeaders, fileData, 60_000,
+    );
+
+    if (!result.ok) {
+      throw new Error(`Image upload failed: ${result.status} - ${result.body.slice(0, 300)}`);
+    }
+
+    // Response is base64-encoded protobuf. Decode and extract the attachment token.
+    // The token starts with "AOo0EE" and is the first long string in the protobuf.
+    let attachmentToken = '';
+    try {
+      const decoded = Buffer.from(result.body, 'base64').toString('utf8');
+      const m = decoded.match(/AOo0EE[A-Za-z0-9+/=]{50,}/);
+      if (m) attachmentToken = m[0];
+    } catch {
+      // Fallback: try reading the raw body
+      const m = result.body.match(/AOo0EE[A-Za-z0-9+/=]{50,}/);
+      if (m) attachmentToken = m[0];
+    }
+
+    if (!attachmentToken) {
+      throw new Error('Failed to extract attachment_token from upload response. Body: ' + result.body.slice(0, 500));
+    }
+
+    log.client.info(`uploadImage: token length=${attachmentToken.length}, file=${fileName}`);
+    return { attachmentToken };
+  }
+
+  /**
+   * Send a message with an image to a space.
+   * Uploads the image first, then sends the message with an UPLOAD_METADATA
+   * annotation via the protobuf path (which works reliably through the proxy).
+   */
+  async sendMessageWithImage(
+    spaceId: string,
+    text: string,
+    imagePath: string,
+  ): Promise<SendMessageResult> {
+    try {
+      const localId = `node-${Date.now()}-${randomUUID().slice(0, 8)}`;
+
+      // Step 1: Upload the image
+      const { attachmentToken } = await this.uploadImage(spaceId, imagePath, localId);
+
+      // Step 2: Send the message with upload annotation via protobuf
+      const fileData = readFileSync(imagePath);
+      const fileName = basename(imagePath);
+      const ext = extname(imagePath).toLowerCase().replace('.', '');
+      const mimeMap: Record<string, string> = {
+        png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+        gif: 'image/gif', webp: 'image/webp',
+      };
+      const mimeType = mimeMap[ext] || 'image/png';
+      const sha256hex = createHash('sha256').update(fileData).digest('hex');
+
+      const uploadAnnotation: UploadAnnotationOptions = {
+        attachmentToken,
+        filename: fileName,
+        contentType: mimeType,
+        fileSize: fileData.length,
+        sha256hex,
+      };
+
+      const protoData = encodeCreateTopicRequest(spaceId, text, localId, undefined, uploadAnnotation);
+      const data = await this.apiRequest<unknown[]>('create_topic', protoData);
+      return this.parseSendResponse(data);
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
+  /**
+   * Reply with an image to an existing thread.
+   * Uploads the image first, then sends the reply with an UPLOAD_METADATA
+   * annotation via the protobuf path.
+   */
+  async replyWithImage(
+    spaceId: string,
+    topicId: string,
+    text: string,
+    imagePath: string,
+  ): Promise<SendMessageResult> {
+    try {
+      const localId = `node-${Date.now()}-${randomUUID().slice(0, 8)}`;
+
+      const { attachmentToken } = await this.uploadImage(spaceId, imagePath, localId, topicId);
+
+      const fileData = readFileSync(imagePath);
+      const fileName = basename(imagePath);
+      const ext = extname(imagePath).toLowerCase().replace('.', '');
+      const mimeMap: Record<string, string> = {
+        png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+        gif: 'image/gif', webp: 'image/webp',
+      };
+      const mimeType = mimeMap[ext] || 'image/png';
+      const sha256hex = createHash('sha256').update(fileData).digest('hex');
+
+      const uploadAnnotation: UploadAnnotationOptions = {
+        attachmentToken,
+        filename: fileName,
+        contentType: mimeType,
+        fileSize: fileData.length,
+        sha256hex,
+      };
+
+      const protoData = encodeCreateMessageRequest(spaceId, topicId, text, localId, undefined, uploadAnnotation);
+      const data = await this.apiRequest<unknown[]>('create_message', protoData);
+      return this.parseSendResponse(data);
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
+  // ─── Mark As Read ───────────────────────────────────────────────────────────
+
   async markAsRead(
     groupId: string,
     unreadCount?: number
   ): Promise<MarkGroupReadstateResult> {
-    // In extension mode, markAsReadBatchExecute uses raw fetch() with Cookie headers
-    // which won't work (cookieString is empty). Go straight to the proto path which
-    // is properly routed through the extension bridge.
     if (this.bridge) {
-      log.client.info(`markAsRead: extension mode – using JSON path for ${groupId}`);
-      return this.markAsReadJson(groupId);
+      log.client.info(`markAsRead: extension mode – trying batchexecute for ${groupId}`);
+      const batchResult = await this.markAsReadBatchExecute(groupId, unreadCount);
+      if (batchResult.success) {
+        return this.clearUnreadTimestamp(groupId, batchResult);
+      }
+
+      log.client.info(`markAsRead: batchexecute failed (${batchResult.error}), trying proto path`);
+      const protoResult = await this.markGroupReadstateProto(groupId);
+      if (protoResult.success) {
+        return this.clearUnreadTimestamp(groupId, protoResult);
+      }
+
+      log.client.info(`markAsRead: proto path failed (${protoResult.error}), trying JSON`);
+      const jsonResult = await this.markAsReadJson(groupId);
+      if (jsonResult.success) {
+        return this.clearUnreadTimestamp(groupId, jsonResult);
+      }
+
+      log.client.info(`markAsRead: JSON path failed (${jsonResult.error}), trying unread-timestamp clear only`);
+      return this.setMarkAsUnreadTimestamp(groupId, 0);
     }
 
     log.client.info(`markAsRead: trying batchexecute for ${groupId}`);
     const batchResult = await this.markAsReadBatchExecute(groupId, unreadCount);
     if (batchResult.success) {
       log.client.info(`markAsRead: batchexecute succeeded`);
-      return batchResult;
+      return this.clearUnreadTimestamp(groupId, batchResult);
     }
 
     log.client.info(`markAsRead: batchexecute failed (${batchResult.error}), trying JSON`);
-    return this.markAsReadJson(groupId);
+    const jsonResult = await this.markAsReadJson(groupId);
+    if (jsonResult.success) {
+      return this.clearUnreadTimestamp(groupId, jsonResult);
+    }
+
+    log.client.info(`markAsRead: JSON path failed (${jsonResult.error}), trying unread-timestamp clear only`);
+    return this.setMarkAsUnreadTimestamp(groupId, 0);
+  }
+
+  private async clearUnreadTimestamp(
+    groupId: string,
+    result: MarkGroupReadstateResult,
+  ): Promise<MarkGroupReadstateResult> {
+    if (!result.success) {
+      return result;
+    }
+
+    const clearResult = await this.setMarkAsUnreadTimestamp(groupId, 0);
+    if (!clearResult.success) {
+      return {
+        success: false,
+        groupId,
+        error: clearResult.error,
+        lastReadTime: result.lastReadTime,
+        unreadMessageCount: result.unreadMessageCount,
+      };
+    }
+
+    return {
+      ...result,
+      lastReadTime: clearResult.lastReadTime ?? result.lastReadTime,
+      unreadMessageCount: clearResult.unreadMessageCount ?? result.unreadMessageCount,
+    };
+  }
+
+  private async setMarkAsUnreadTimestamp(
+    groupId: string,
+    timestampMicros: number,
+  ): Promise<MarkGroupReadstateResult> {
+    try {
+      const isDirectMessage = isDmId(groupId);
+      const payload: unknown[] = new Array(99).fill(null);
+      payload[0] = isDirectMessage ? [null, null, [groupId]] : [[groupId]];
+      payload[1] = timestampMicros;
+      payload[98] = this.buildMutationRequestHeader();
+
+      const data = await this.apiRequestJson<unknown[]>('set_mark_as_unread_timestamp', payload, groupId);
+      return this.parseMarkReadstateResponse(data, groupId);
+    } catch (error) {
+      return {
+        success: false,
+        groupId,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
+  private async setThreadMarkAsUnreadTimestamp(
+    spaceId: string,
+    topicId: string,
+    timestampMicros: number,
+  ): Promise<MarkGroupReadstateResult> {
+    const candidates: unknown[][] = [];
+    const groupRef = isDmId(spaceId) ? [null, null, [spaceId]] : [[spaceId]];
+
+    const threadRefPayload = new Array(99).fill(null);
+    threadRefPayload[0] = [null, topicId, groupRef];
+    threadRefPayload[1] = timestampMicros;
+    threadRefPayload[98] = this.buildMutationRequestHeader();
+    candidates.push(threadRefPayload);
+
+    const topicIdPayload = new Array(99).fill(null);
+    topicIdPayload[0] = [[[spaceId]], topicId];
+    topicIdPayload[1] = timestampMicros;
+    topicIdPayload[98] = this.buildMutationRequestHeader();
+    candidates.push(topicIdPayload);
+
+    let lastError = 'Unknown error';
+    for (const payload of candidates) {
+      try {
+        const data = await this.apiRequestJson<unknown[]>('set_mark_as_unread_timestamp', payload, spaceId);
+        return this.parseMarkReadstateResponse(data, spaceId);
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : 'Unknown error';
+      }
+    }
+
+    return {
+      success: false,
+      groupId: spaceId,
+      error: lastError,
+    };
+  }
+
+  private async markTopicReadstate(
+    spaceId: string,
+    topicId: string,
+    timestampMicros: number,
+  ): Promise<MarkGroupReadstateResult> {
+    const requestHeaders = [
+      this.buildMutationRequestHeader(),
+      this.buildPbliteRequestHeader(),
+    ];
+
+    let lastFailure: MarkGroupReadstateResult | undefined;
+    for (const requestHeader of requestHeaders) {
+      try {
+        const payload: unknown[] = new Array(99).fill(null);
+        payload[0] = [null, topicId, isDmId(spaceId) ? [null, null, [spaceId]] : [[spaceId]]];
+        payload[1] = timestampMicros;
+        payload[98] = requestHeader;
+
+        const data = await this.apiRequestJson<unknown[]>('mark_topic_readstate', payload, spaceId);
+        log.client.debug(`mark_topic_readstate raw response: ${JSON.stringify(data).slice(0, 500)}`);
+
+        // Parse the topic readstate response.  The dfe.rs.mtrs wrapper
+        // contains a readState array with this layout:
+        //   [0] = identity (user + topic ref)
+        //   [1] = last_read_time (string usec)
+        //   [3] = unread_count (string)
+        //   [6] = subscription_state (-1 is normal, NOT an error)
+        //   [7] = server_timestamp
+        // A genuine failure is an HTTP error or a missing/malformed response;
+        // the value at field 6 is NOT a status code.
+        return this.parseTopicReadstateResponse(data, spaceId);
+      } catch (error) {
+        lastFailure = {
+          success: false,
+          groupId: spaceId,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        };
+      }
+    }
+
+    return lastFailure ?? {
+      success: false,
+      groupId: spaceId,
+      error: 'Unknown error',
+    };
+  }
+
+  private async getLatestThreadTimestamp(spaceId: string, topicId: string): Promise<number> {
+    try {
+      const thread = await this.getThread(spaceId, topicId, 100);
+      const latest = thread.messages[thread.messages.length - 1]?.timestamp_usec;
+      log.client.info('getLatestThreadTimestamp', JSON.stringify({
+        spaceId,
+        topicId,
+        totalMessages: thread.messages.length,
+        latestTimestamp: latest,
+      }));
+      return latest ?? Date.now() * 1000;
+    } catch {
+      return Date.now() * 1000;
+    }
+  }
+
+  private async markGroupReadstateProto(
+    groupId: string,
+    timestampMicros?: number,
+  ): Promise<MarkGroupReadstateResult> {
+    try {
+      const protoData = encodeMarkGroupReadstateRequest(groupId, timestampMicros);
+      const data = await this.apiRequest<unknown[]>('mark_group_readstate', protoData);
+      return this.parseMarkReadstateResponse(data, groupId);
+    } catch (error) {
+      return {
+        success: false,
+        groupId,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
   }
 
   private async markAsReadBatchExecute(
@@ -3682,9 +5082,7 @@ export class GoogleChatClient {
     unreadCount?: number
   ): Promise<MarkGroupReadstateResult> {
     try {
-      if (!this.auth) {
-        await this.authenticate();
-      }
+      await this.ensureAuth();
 
       const isDirectMessage = isDmId(groupId);
       const groupPrefix = isDirectMessage ? 'dm' : 'space';
@@ -3702,18 +5100,24 @@ export class GoogleChatClient {
 
       const url = `${API_BASE}/_/DynamiteWebUi/data/batchexecute?rpcids=G23hcc&source-path=/u/0/mole/world&bl=boq_dynamiteuiserver_20260113.02_p1&hl=en&soc-app=1&soc-platform=1&soc-device=1&rt=c`;
 
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Cookie': this.auth!.cookieString,
-          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-          'Origin': 'https://chat.google.com',
-          'Referer': 'https://chat.google.com/',
-          'User-Agent': USER_AGENT,
-          'x-same-domain': '1',
-        },
-        body: requestBody,
-      });
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        'Origin': 'https://chat.google.com',
+        'Referer': 'https://chat.google.com/',
+        'User-Agent': USER_AGENT,
+        'x-same-domain': '1',
+      };
+
+      const response = this.bridge
+        ? await this.bridge.proxyRequest(url, 'POST', headers, requestBody).then((result) => new Response(result.body, { status: result.status }))
+        : await fetch(url, {
+            method: 'POST',
+            headers: {
+              'Cookie': this.auth!.cookieString,
+              ...headers,
+            },
+            body: requestBody,
+          });
 
       const text = await response.text();
       log.client.debug(`markAsReadBatch: status=${response.status}, response=${text.slice(0, 500)}`);
@@ -3760,11 +5164,11 @@ export class GoogleChatClient {
 
       // 99-element pblite payload matching the mark_group_readstate JSON API.
       // Field 1 = spaceId wrapper → [[groupId]] for spaces
-      // Field 2 = dmId wrapper   → [null, [groupId]] for DMs (pblite field offset)
+      // Field 3 = dmId wrapper   → [null, null, [groupId]] for DMs (pblite field 3)
       const payload: unknown[] = new Array(99).fill(null);
-      payload[0]  = isDirectMessage ? [null, [groupId]] : [[groupId]];
+      payload[0]  = isDirectMessage ? [null, null, [groupId]] : [[groupId]];
       payload[1]  = timestamp;
-      payload[98] = this.buildPbliteRequestHeader();
+      payload[98] = this.buildMutationRequestHeader();
 
       log.client.debug(`markAsReadJson: payload[0]=${JSON.stringify(payload[0])}`);
 
@@ -3782,6 +5186,172 @@ export class GoogleChatClient {
     }
   }
 
+  /**
+   * Mark a space or DM as unread.
+   *
+   * Uses `mark_group_readstate` with timestamp=0 to reset the read watermark
+   * so Google Chat displays the bold/badge indicator again. A specific
+   * microsecond timestamp can be provided to mark as unread from that point.
+   */
+  async markAsUnread(
+    groupId: string,
+    timestampMicros?: number
+  ): Promise<MarkGroupReadstateResult> {
+    const ts = timestampMicros ?? 0;
+    const isDirectMessage = isDmId(groupId);
+
+    if (isDirectMessage) {
+      log.client.info(`markAsUnread: trying set_mark_as_unread_timestamp for ${groupId}`);
+      const unreadTimestampResult = await this.setMarkAsUnreadTimestamp(groupId, ts);
+      if (unreadTimestampResult.success) {
+        return unreadTimestampResult;
+      }
+
+      log.client.info(`markAsUnread: set_mark_as_unread_timestamp failed (${unreadTimestampResult.error}), falling back`);
+    }
+
+    if (this.bridge) {
+      log.client.info(`markAsUnread: extension mode – trying proto path for ${groupId}`);
+      const protoResult = await this.markGroupReadstateProto(groupId, ts);
+      if (protoResult.success) {
+        return protoResult;
+      }
+
+      log.client.info(`markAsUnread: proto path failed (${protoResult.error}), trying JSON`);
+    }
+
+    try {
+      log.client.debug(`markAsUnread: groupId=${groupId}, timestamp=${ts}, isDm=${isDirectMessage}`);
+
+      const payload: unknown[] = new Array(99).fill(null);
+      payload[0]  = isDirectMessage ? [null, null, [groupId]] : [[groupId]];
+      payload[1]  = ts;
+      payload[98] = this.buildMutationRequestHeader();
+
+      await this.apiRequestJson<unknown[]>('mark_group_readstate', payload, groupId);
+      log.client.debug(`markAsUnread: success for ${groupId}`);
+
+      return { success: true, groupId };
+    } catch (error) {
+      log.client.error(`markAsUnread: error=${error instanceof Error ? error.message : error}`);
+      return {
+        success: false,
+        groupId,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
+  async markThreadAsRead(
+    spaceId: string,
+    topicId: string,
+    timestampMicros?: number,
+  ): Promise<MarkGroupReadstateResult> {
+    const timestamp = timestampMicros ?? await this.getLatestThreadTimestamp(spaceId, topicId);
+    const markResult = await this.markTopicReadstate(spaceId, topicId, timestamp);
+
+    if (!markResult.success) {
+      return markResult;
+    }
+
+    // After mark_topic_readstate succeeds, clear the unread timestamp to
+    // remove the promoted-thread indicator from paginated_world.
+    // Try thread-level first, then fall back to space-level clear (which is
+    // how clearUnreadTimestamp works for regular markAsRead).
+    let clearResult = await this.setThreadMarkAsUnreadTimestamp(spaceId, topicId, 0);
+    if (!clearResult.success) {
+      log.client.debug(
+        `markThreadAsRead: thread-level unread clear failed (${clearResult.error}), trying space-level`
+      );
+      clearResult = await this.setMarkAsUnreadTimestamp(spaceId, 0);
+    }
+    if (!clearResult.success) {
+      log.client.warn(
+        `markThreadAsRead: mark_topic_readstate OK but clearing unread timestamp failed: ${clearResult.error}`
+      );
+      // Still return success — the readstate itself was marked correctly.
+      // Record this thread as recently marked so parseWorldItems suppresses
+      // the stale readState[20] indicator.
+      this.markedThreads.set(`${spaceId}/${topicId}`, Date.now());
+      this.pruneMarkedThreadsCache();
+      return markResult;
+    }
+
+    // Record this thread as recently marked so parseWorldItems can suppress
+    // the stale readState[20] indicator from paginated_world.
+    this.markedThreads.set(`${spaceId}/${topicId}`, Date.now());
+    this.pruneMarkedThreadsCache();
+
+    // Also advance the space-level read watermark.  paginated_world has a
+    // "last activity" timestamp (readState[5]) that the UI compares against
+    // the read watermark (readState[1]).  mark_topic_readstate only touches
+    // the thread readstate, not the space watermark, so without this the
+    // space can still show a blue dot even though the thread is read.
+    const spaceMarkResult = await this.markAsReadJson(spaceId);
+    if (!spaceMarkResult.success) {
+      log.client.debug(`markThreadAsRead: space-level markAsRead failed (${spaceMarkResult.error}), thread still marked OK`);
+    }
+
+    log.client.info(`markThreadAsRead: fully cleared thread ${topicId} in space ${spaceId}`);
+    return {
+      ...markResult,
+      lastReadTime: clearResult.lastReadTime ?? markResult.lastReadTime,
+      unreadMessageCount: clearResult.unreadMessageCount ?? markResult.unreadMessageCount,
+    };
+  }
+
+  async markThreadAsUnread(
+    spaceId: string,
+    topicId: string,
+    timestampMicros?: number,
+  ): Promise<MarkGroupReadstateResult> {
+    return this.setThreadMarkAsUnreadTimestamp(spaceId, topicId, timestampMicros ?? Date.now() * 1000);
+  }
+
+  /**
+   * Parse a mark_topic_readstate (dfe.rs.mtrs) response.
+   *
+   * Response layout: [["dfe.rs.mtrs", readState, []]]
+   * readState: [identity, lastReadTime, null, unreadCount, readCount, null,
+   *             subscriptionState, serverTimestamp, null, totalCount]
+   *
+   * Field 6 (subscriptionState) is commonly -1 and is NOT an error code.
+   * Success is determined by whether lastReadTime was set.
+   */
+  private parseTopicReadstateResponse(
+    data: unknown[],
+    groupId: string,
+  ): MarkGroupReadstateResult {
+    if (!Array.isArray(data)) {
+      return { success: false, groupId, error: 'Invalid response format' };
+    }
+
+    // Unwrap: data[0] = ["dfe.rs.mtrs", readState, []]
+    let wrapper = data[0];
+    if (Array.isArray(wrapper) && wrapper[0] === 'dfe.rs.mtrs') {
+      const readState = wrapper[1];
+      if (Array.isArray(readState)) {
+        const lastReadTime = this.toOptionalNumber(readState[1]);
+        const unreadMessageCount = this.toOptionalNumber(readState[3]) ?? 0;
+        const serverTimestamp = typeof readState[7] === 'number' ? readState[7] : undefined;
+
+        if (lastReadTime != null || serverTimestamp != null) {
+          log.client.info(`mark_topic_readstate OK: lastRead=${lastReadTime}, unread=${unreadMessageCount}, serverTs=${serverTimestamp}`);
+          return {
+            success: true,
+            groupId,
+            lastReadTime,
+            unreadMessageCount,
+          };
+        }
+      }
+    }
+
+    // Fallback: could not parse expected structure
+    log.client.warn(`mark_topic_readstate: unexpected response shape: ${JSON.stringify(data).slice(0, 300)}`);
+    return { success: false, groupId, error: 'Unexpected response format' };
+  }
+
   private parseMarkReadstateResponse(
     data: unknown[],
     groupId: string
@@ -3792,11 +5362,60 @@ export class GoogleChatClient {
 
     let lastReadTime: number | undefined;
     let unreadMessageCount: number | undefined;
+    let statusCode: number | undefined;
+    let responseType: string | undefined;
 
-    const readState = data[0];
+    const findReadState = (value: unknown, depth = 0): unknown[] | undefined => {
+      if (depth > 4 || !Array.isArray(value)) {
+        return undefined;
+      }
+
+      if (
+        value.length >= 2 &&
+        Array.isArray(value[1]) &&
+        (typeof value[2] === 'string' || typeof value[7] === 'number' || typeof value[8] === 'number')
+      ) {
+        return value;
+      }
+
+      for (const child of value) {
+        const found = findReadState(child, depth + 1);
+        if (found) {
+          return found;
+        }
+      }
+
+      return undefined;
+    };
+
+    let readState: unknown = data[0];
+    if (Array.isArray(readState) && typeof readState[0] === 'string') {
+      responseType = readState[0];
+      readState = findReadState(readState[1]) ?? readState;
+    }
+
     if (Array.isArray(readState)) {
-      lastReadTime = typeof readState[1] === 'number' ? readState[1] : undefined;
-      unreadMessageCount = typeof readState[3] === 'number' ? readState[3] : 0;
+      lastReadTime = typeof readState[8] === 'number'
+        ? readState[8]
+        : typeof readState[1] === 'number'
+          ? readState[1]
+          : undefined;
+      unreadMessageCount = typeof readState[10] === 'number'
+        ? readState[10]
+        : typeof readState[3] === 'number'
+          ? readState[3]
+          : 0;
+      statusCode = typeof readState[7] === 'number' ? readState[7] : undefined;
+    }
+
+    if (statusCode != null && statusCode < 0) {
+      return {
+        success: false,
+        groupId,
+        lastReadTime,
+        unreadMessageCount,
+        error: `${responseType ?? 'mark_readstate'} returned status ${statusCode}`,
+      };
     }
 
     return {
@@ -3805,6 +5424,25 @@ export class GoogleChatClient {
       lastReadTime,
       unreadMessageCount,
     };
+  }
+
+  private extractMarkReadstateStatusCode(value: unknown, depth = 0): number | undefined {
+    if (depth > 5 || !Array.isArray(value)) {
+      return undefined;
+    }
+
+    if (typeof value[7] === 'number') {
+      return value[7] as number;
+    }
+
+    for (const child of value) {
+      const found = this.extractMarkReadstateStatusCode(child, depth + 1);
+      if (found != null) {
+        return found;
+      }
+    }
+
+    return undefined;
   }
 
   private parseSendResponse(data: unknown[]): SendMessageResult {
@@ -4130,67 +5768,16 @@ export class GoogleChatClient {
     parallel?: number;
     forceRefresh?: boolean;
   } = {}): Promise<{
-    badges: {
-      totalUnread: number;
-      mentions: number;
-      directMentions: number;
-      allMentions: number;
-      subscribedThreads: number;
-      subscribedSpaces: number;
-      directMessages: number;
-    };
-    mentions: Array<{
-      spaceId: string;
-      spaceName?: string;
-      topicId?: string;
-      messageId?: string;
-      messageText?: string;
-      mentionType: 'direct' | 'all' | 'none';
-      mentionedBy?: string;
-      timestamp?: number;
-    }>;
-    directMentions: Array<{
-      spaceId: string;
-      spaceName?: string;
-      topicId?: string;
-      messageId?: string;
-      messageText?: string;
-      mentionType: 'direct' | 'all' | 'none';
-      mentionedBy?: string;
-      timestamp?: number;
-    }>;
-    subscribedThreads: Array<{
-      spaceId: string;
-      spaceName?: string;
-      topicId: string;
-      unreadCount: number;
-      lastMessageText?: string;
-      isSubscribed: boolean;
-      isParticipant: boolean;
-    }>;
-    subscribedSpaces: Array<{
-      spaceId: string;
-      spaceName?: string;
-      type: 'space' | 'dm';
-      unreadCount: number;
-      isSubscribed: boolean;
-      hasMention: boolean;
-    }>;
-    directMessages: Array<{
-      spaceId: string;
-      spaceName?: string;
-      type: 'space' | 'dm';
-      unreadCount: number;
-    }>;
+    badges: import('./types.js').UnreadBadgeCounts;
+    /** Non-badged unread spaces, including lit_up and promoted thread-unread spaces */
+    spaces: import('./types.js').UnreadSpace[];
+    /** DMs with badged or lit_up state */
+    directMessages: import('./types.js').UnreadSpace[];
     allUnreads: WorldItemSummary[];
     selfUserId?: string;
   }> {
     const {
-      fetchMessages = true,
-      messagesPerSpace = 5,
       unreadOnly = true,
-      checkParticipation = false,
-      parallel = 5,
       forceRefresh = false,
     } = options;
 
@@ -4199,190 +5786,78 @@ export class GoogleChatClient {
 
     const { items } = await this.fetchWorldItems({ forceRefresh });
 
-    const mentions: Array<{
-      spaceId: string;
-      spaceName?: string;
-      topicId?: string;
-      messageId?: string;
-      messageText?: string;
-      mentionType: 'direct' | 'all' | 'none';
-      mentionedBy?: string;
-      timestamp?: number;
-    }> = [];
-    const directMentions: typeof mentions = [];
-    const subscribedThreads: Array<{
-      spaceId: string;
-      spaceName?: string;
-      topicId: string;
-      unreadCount: number;
-      lastMessageText?: string;
-      isSubscribed: boolean;
-      isParticipant: boolean;
-    }> = [];
-    const subscribedSpaces: Array<{
-      spaceId: string;
-      spaceName?: string;
-      type: 'space' | 'dm';
-      unreadCount: number;
-      isSubscribed: boolean;
-      hasMention: boolean;
-    }> = [];
-    const directMessages: Array<{
-      spaceId: string;
-      spaceName?: string;
-      type: 'space' | 'dm';
-      unreadCount: number;
-    }> = [];
+    const {
+      badgedDMs,
+      badgedSpaces,
+      litupDMs,
+      litupSpaces,
+      threadUnreadSpaces: promotedThreadUnreadSpaces,
+    } = this.partitionNotificationItems(items);
+
+    const spaces: import('./types.js').UnreadSpace[] = [];
+    const directMessages: import('./types.js').UnreadSpace[] = [];
 
     const itemsToProcess = unreadOnly
-      ? items.filter((item) => item.notificationCategory !== 'none')
+      ? items.filter((item) => this.isUnreadItem(item))
       : items;
 
     for (const item of itemsToProcess) {
-      const unreadSpace = {
+      const unreadSpace: import('./types.js').UnreadSpace = {
         spaceId: item.id,
         spaceName: item.name,
         type: item.type,
         unreadCount: item.unreadCount,
+        unreadSubscribedTopicCount: item.unreadSubscribedTopicCount,
+        lastMentionTime: item.lastMentionTime,
+        unreadReplyCount: item.unreadReplyCount,
+        lastMessageText: item.lastMessageText,
+        subscribedThreadId: item.subscribedThreadId,
+        threadIds: item.threadIds,
         isSubscribed: item.isSubscribedToSpace ?? false,
-        hasMention: item.notificationCategory === 'direct_mention',
+        hasMention: false,
+        hasDirect: item.type === 'dm',
+        badgeCount: item.badgeCount,
+        notificationCategory: item.notificationCategory,
+        promotedThreadUnread: this.isThreadUnreadSpace(item),
       };
 
-      switch (item.notificationCategory) {
-        case 'direct_mention':
-          subscribedSpaces.push(unreadSpace);
-          break;
-        case 'subscribed_thread':
-          if (item.subscribedThreadId) {
-            subscribedThreads.push({
-              spaceId: item.id,
-              spaceName: item.name,
-              topicId: item.subscribedThreadId,
-              unreadCount: item.unreadSubscribedTopicCount,
-              lastMessageText: item.lastMessageText,
-              isSubscribed: true,
-              isParticipant: false,
-            });
-          }
-          subscribedSpaces.push(unreadSpace);
-          break;
-        case 'subscribed_space':
-          subscribedSpaces.push(unreadSpace);
-          break;
-        case 'direct_message':
-          directMessages.push({
-            spaceId: item.id,
-            spaceName: item.name,
-            type: item.type,
-            unreadCount: item.unreadCount,
-          });
-          break;
-        default:
-          if (!unreadOnly) {
-            subscribedSpaces.push(unreadSpace);
-          }
+      if (item.type === 'dm') {
+        directMessages.push(unreadSpace);
+      } else {
+        spaces.push(unreadSpace);
       }
     }
 
-    if (fetchMessages) {
-      const mentionCandidates = itemsToProcess.filter(
-        (item) =>
-          item.notificationCategory === 'direct_mention' ||
-          item.lastMentionTime
-      );
+    // Aggregate server-provided badge counts
+    const serverBadgeTotal = itemsToProcess.reduce(
+      (sum, item) => sum + (item.badgeCount ?? 0), 0
+    );
 
-      for (let i = 0; i < mentionCandidates.length; i += parallel) {
-        const batch = mentionCandidates.slice(i, i + parallel);
-        const results = await Promise.allSettled(
-          batch.map(async (item) => {
-            const result = await this.getThreads(item.id, {
-              pageSize: messagesPerSpace,
-            });
-            return { item, messages: result.messages };
-          })
-        );
+    const badgedItems = itemsToProcess.filter(i => i.notificationCategory === 'badged');
+    const litUpItems = itemsToProcess.filter(i => i.notificationCategory === 'lit_up');
 
-        for (const settledResult of results) {
-          if (settledResult.status !== 'fulfilled') continue;
-
-          const { item, messages } = settledResult.value;
-
-          for (const msg of messages) {
-            const mentionInfo = this.checkMentionType(msg, selfUserId);
-            if (mentionInfo === 'none') continue;
-
-            const mention = {
-              spaceId: item.id,
-              spaceName: item.name,
-              topicId: msg.topic_id,
-              messageId: msg.message_id,
-              messageText: msg.text,
-              mentionType: mentionInfo,
-              mentionedBy: msg.sender,
-              timestamp: msg.timestamp_usec,
-            };
-
-            mentions.push(mention);
-            if (mentionInfo === 'direct') {
-              directMentions.push(mention);
-            }
-          }
-        }
-      }
-
-      mentions.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-      directMentions.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-    }
-
-    if (checkParticipation && subscribedThreads.length > 0) {
-      for (let i = 0; i < subscribedThreads.length; i += parallel) {
-        const batch = subscribedThreads.slice(i, i + parallel);
-        const results = await Promise.allSettled(
-          batch.map(async (thread) => {
-            const result = await this.getThread(thread.spaceId, thread.topicId, 50);
-            return { thread, messages: result.messages };
-          })
-        );
-
-        for (const settledResult of results) {
-          if (settledResult.status !== 'fulfilled') continue;
-
-          const { thread, messages } = settledResult.value;
-          thread.isParticipant = messages.some(
-            (msg) => msg.sender_id === selfUserId
-          );
-
-          if (messages.length > 0) {
-            thread.lastMessageText = messages[messages.length - 1].text;
-          }
-        }
-      }
-    }
-
-    const uniqueSpaceIds = new Set<string>();
-    for (const m of mentions) uniqueSpaceIds.add(m.spaceId);
-    for (const t of subscribedThreads) uniqueSpaceIds.add(t.spaceId);
-    for (const s of subscribedSpaces) uniqueSpaceIds.add(s.spaceId);
-    for (const d of directMessages) uniqueSpaceIds.add(d.spaceId);
-
-    const allMentionsCount = mentions.filter(m => m.mentionType === 'all').length;
+    // Find the most recent notif-worthy event across all items
+    const latestNotifWorthyEvent = itemsToProcess.reduce<number | undefined>(
+      (latest, item) => {
+        const ts = item.lastNotifWorthyEventTimestamp;
+        if (ts && (!latest || ts > latest)) return ts;
+        return latest;
+      },
+      undefined
+    );
 
     return {
       badges: {
-        totalUnread: uniqueSpaceIds.size,
-        mentions: mentions.length,
-        directMentions: directMentions.length,
-        allMentions: allMentionsCount,
-        subscribedThreads: subscribedThreads.length,
-        subscribedSpaces: subscribedSpaces.filter(
-          (s) => s.unreadCount > 0
-        ).length,
-        directMessages: directMessages.filter((d) => d.unreadCount > 0).length,
+        totalUnread: badgedDMs.length + badgedSpaces.length + litupDMs.length + litupSpaces.length + promotedThreadUnreadSpaces.length,
+        badgedCount: badgedItems.length,
+        litUpCount: litUpItems.length,
+        directMessages: badgedItems.filter(i => i.type === 'dm').length,
+        badgedSpaces: badgedItems.filter(i => i.type === 'space').length,
+        threadUnreadCount: promotedThreadUnreadSpaces.length,
+        serverBadgeTotal,
+        latestNotifWorthyEvent,
       },
-      mentions,
-      directMentions,
-      subscribedThreads,
-      subscribedSpaces,
+      spaces,
       directMessages,
       allUnreads: itemsToProcess,
       selfUserId,
@@ -4412,35 +5887,42 @@ export class GoogleChatClient {
     return 'none';
   }
 
-  async getUnreadBadgeCounts(): Promise<{
-    totalUnread: number;
-    mentions: number;
-    subscribedThreads: number;
-    subscribedSpaces: number;
-    directMessages: number;
-  }> {
+  async getUnreadBadgeCounts(): Promise<import('./types.js').UnreadBadgeCounts> {
     const { items } = await this.fetchWorldItems();
-    const unreads = items.filter((item) => item.notificationCategory !== 'none');
 
-    const mentions = unreads.filter(
-      (item) => item.notificationCategory === 'direct_mention'
+    const {
+      badgedDMs,
+      badgedSpaces,
+      litupDMs,
+      litupSpaces,
+      threadUnreadSpaces,
+    } = this.partitionNotificationItems(items);
+
+    const badged = items.filter((item) => item.notificationCategory === 'badged');
+    const litUp = items.filter((item) => item.notificationCategory === 'lit_up');
+
+    const serverBadgeTotal = items.reduce(
+      (sum, item) => sum + (item.badgeCount ?? 0), 0
     );
-    const threads = unreads.filter(
-      (item) => item.notificationCategory === 'subscribed_thread'
-    );
-    const spaces = unreads.filter(
-      (item) => item.notificationCategory === 'subscribed_space'
-    );
-    const dms = unreads.filter(
-      (item) => item.notificationCategory === 'direct_message'
+
+    const latestNotifWorthyEvent = items.reduce<number | undefined>(
+      (latest, item) => {
+        const ts = item.lastNotifWorthyEventTimestamp;
+        if (ts && (!latest || ts > latest)) return ts;
+        return latest;
+      },
+      undefined
     );
 
     return {
-      totalUnread: unreads.length,
-      mentions: mentions.length,
-      subscribedThreads: threads.length,
-      subscribedSpaces: spaces.length,
-      directMessages: dms.length,
+      totalUnread: badgedDMs.length + badgedSpaces.length + litupDMs.length + litupSpaces.length + threadUnreadSpaces.length,
+      badgedCount: badged.length,
+      litUpCount: litUp.length,
+      directMessages: badged.filter(i => i.type === 'dm').length,
+      badgedSpaces: badged.filter(i => i.type === 'space').length,
+      threadUnreadCount: threadUnreadSpaces.length,
+      serverBadgeTotal,
+      latestNotifWorthyEvent,
     };
   }
 
@@ -4496,9 +5978,7 @@ export class GoogleChatClient {
       isFirstPage: boolean;
     }
   ): Promise<SearchResponse> {
-    if (!this.auth) {
-      await this.authenticate();
-    }
+    await this.ensureAuth();
 
     const { sessionId, cursor, pageSize, isFirstPage } = options;
 
@@ -4716,5 +6196,319 @@ export class GoogleChatClient {
       unreadCount: (item[11] as number) || undefined,
       rosterId: (item[47] as string) || undefined,
     };
+  }
+
+  // ─── SDK parity methods ──────────────────────────────────────────────────
+  // These bring the SDK to feature-parity with the API server's orchestration
+  // endpoints so external consumers get the same capabilities programmatically.
+
+  /**
+   * Aggregated notification view with filtering, parallel message fetching,
+   * and @mention scanning.  Mirrors the API server's `GET /api/notifications`.
+   */
+  async getNotifications(options: NotificationOptions = {}): Promise<NotificationResult> {
+    const {
+      mentions = false,
+      threads = false,
+      spaces: filterSpaces = false,
+      dms: filterDms = false,
+      read = false,
+      me = false,
+      atAll = false,
+      space: filterSpace,
+      showMessages: showMessagesOpt = false,
+      limit = 0,
+      offset = 0,
+      parallel = 5,
+      messagesLimit = 3,
+    } = options;
+
+    const showMessages = showMessagesOpt || me || atAll;
+
+    let { items } = await this.fetchWorldItems();
+
+    // @me shortcut: restrict to the mentions-shortcut space
+    let mentionsShortcutId: string | undefined;
+    if (me && !filterSpace) {
+      const mentionsSpaces = await this.findSpaces('mentions');
+      const mentionsShortcut = mentionsSpaces.find(
+        (s) =>
+          s.name?.toLowerCase().includes('mentions') ||
+          s.name?.toLowerCase() === 'mentions-shortcut',
+      );
+      if (mentionsShortcut) {
+        mentionsShortcutId = mentionsShortcut.id;
+        items = items.filter((i) => i.id === mentionsShortcutId);
+      }
+    }
+
+    if (filterSpace) {
+      items = items.filter((i) => i.id === filterSpace);
+    }
+
+    if (me || atAll) {
+      await this.getSelfUser();
+    }
+
+    // Strip internal fields from output
+    const sanitize = ({
+      unreadCount: _a,
+      unreadSubscribedTopicCount: _b,
+      unreadReplyCount: _c,
+      notificationLevel: _d,
+      _memberUserIds: _e,
+      ...rest
+    }: WorldItemSummary): WorldItemSummary => rest as WorldItemSummary;
+
+    const {
+      badgedDMs,
+      badgedSpaces,
+      litupDMs,
+      litupSpaces,
+      threadUnreadSpaces,
+      readItems,
+    } = this.partitionNotificationItems(items);
+    const unreadDMs = [...badgedDMs, ...litupDMs];
+    const badgedItems = [...badgedDMs, ...badgedSpaces];
+    const unreadSpaces = [...litupSpaces, ...threadUnreadSpaces];
+
+    const hasFilter = mentions || threads || filterSpaces || filterDms || read || me || atAll;
+    let itemsToProcess: WorldItemSummary[] = [];
+
+    if (hasFilter && !me && !atAll) {
+      if (mentions) itemsToProcess = itemsToProcess.concat(badgedItems);
+      if (threads) itemsToProcess = itemsToProcess.concat(threadUnreadSpaces);
+      if (filterSpaces) itemsToProcess = itemsToProcess.concat(unreadSpaces);
+      if (filterDms) itemsToProcess = itemsToProcess.concat(unreadDMs);
+      if (read) itemsToProcess = itemsToProcess.concat(readItems);
+    } else if (me || atAll) {
+      itemsToProcess = [...badgedItems];
+    } else {
+      itemsToProcess = [...unreadDMs, ...badgedSpaces, ...unreadSpaces];
+    }
+
+    // De-duplicate across overlapping filters
+    const seen = new Set<string>();
+    itemsToProcess = itemsToProcess.filter((i) => {
+      if (seen.has(i.id)) return false;
+      seen.add(i.id);
+      return true;
+    });
+
+    const totalItems = itemsToProcess.length;
+    if (offset > 0) {
+      itemsToProcess = itemsToProcess.slice(offset);
+    }
+    if (limit > 0) {
+      itemsToProcess = itemsToProcess.slice(0, limit);
+    }
+
+    const directMeMentions: WorldItemSummary[] = [];
+    const atAllMentions: WorldItemSummary[] = [];
+    const messages: Record<string, Message[]> = {};
+
+    if (showMessages && itemsToProcess.length > 0) {
+      for (let i = 0; i < itemsToProcess.length; i += parallel) {
+        const batch = itemsToProcess.slice(i, i + parallel);
+        const results = await Promise.allSettled(
+          batch.map(async (item) => {
+            const result = await this.getThreads(item.id, { pageSize: messagesLimit });
+            return { item, result };
+          }),
+        );
+
+        for (const settledResult of results) {
+          if (settledResult.status === 'fulfilled') {
+            const { item, result } = settledResult.value;
+            if (result.messages.length > 0) {
+              messages[item.id] = result.messages;
+
+              if (me || atAll) {
+                let hasDirectMe = false;
+                let hasAtAll = false;
+                for (const msg of result.messages) {
+                  if (this.isDirectlyMentioned(msg)) hasDirectMe = true;
+                  if (this.hasAllMention(msg)) hasAtAll = true;
+                }
+                if (hasDirectMe) directMeMentions.push(item);
+                if (hasAtAll && !hasDirectMe) atAllMentions.push(item);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const serverBadgeTotal = items.reduce((sum, i) => sum + (i.badgeCount ?? 0), 0);
+
+    return {
+      unreadDMs: unreadDMs.map(sanitize),
+      badgedSpaces: badgedSpaces.map(sanitize),
+      unreadSpaces: unreadSpaces.map(sanitize),
+      directMeMentions: me ? directMeMentions.map(sanitize) : [],
+      atAllMentions: atAll ? atAllMentions.map(sanitize) : [],
+      badges: {
+        totalUnread: unreadDMs.length + badgedSpaces.length + unreadSpaces.length,
+        badgedCount: badgedItems.length,
+        litUpCount: litupSpaces.length,
+        unreadDMCount: unreadDMs.length,
+        threadUnreadCount: threadUnreadSpaces.length,
+        serverBadgeTotal,
+      },
+      messages: showMessages ? messages : undefined,
+      mentionsShortcutId: mentionsShortcutId || undefined,
+      pagination: {
+        total: totalItems,
+        offset,
+        limit: limit || totalItems,
+        returned: itemsToProcess.length,
+        hasMore: offset + itemsToProcess.length < totalItems,
+      },
+    };
+  }
+
+  /**
+   * Force-refresh world items and return a computed unread summary.
+   * Mirrors the API server's `GET /api/unreads/refresh`.
+   */
+  async refreshUnreads(): Promise<RefreshUnreadsResult> {
+    const { items } = await this.fetchWorldItems({ forceRefresh: true });
+    const { threadUnreadSpaces } = this.partitionNotificationItems(items);
+    const badged = items.filter((i) => i.notificationCategory === 'badged');
+    const litUp = items.filter((i) => i.notificationCategory === 'lit_up');
+    const unreads = items.filter((i) => this.isUnreadItem(i));
+
+    const serverBadgeTotal = items.reduce((sum, i) => sum + (i.badgeCount ?? 0), 0);
+
+    return {
+      unreads,
+      total: unreads.length,
+      summary: {
+        totalUnread: unreads.length,
+        badgedCount: badged.length,
+        litUpCount: litUp.length,
+        threadUnreadCount: threadUnreadSpaces.length,
+        serverBadgeTotal,
+        directMessages: unreads.filter((i) => i.type === 'dm').length,
+        badgedSpaces: badged.filter((i) => i.type === 'space').length,
+      },
+    };
+  }
+
+  /**
+   * Resolve DM IDs to the "other" user in each conversation, then
+   * batch-fetch their presence with profile info.
+   * Mirrors the API server's `GET /api/dms/presence`.
+   */
+  async getDMPresenceByDmIds(
+    dmIds: string[],
+    options: { parallel?: number } = {},
+  ): Promise<DMPresenceResult> {
+    const parallel = options.parallel ?? 5;
+
+    if (dmIds.length === 0) {
+      return { presences: [], total: 0 };
+    }
+
+    const dmToUser = new Map<string, string>();
+    const selfUser = await this.getSelfUser();
+    const selfUserId = selfUser?.userId;
+
+    const uniqueDmIds = Array.from(new Set(dmIds));
+    for (let i = 0; i < uniqueDmIds.length; i += parallel) {
+      const batch = uniqueDmIds.slice(i, i + parallel);
+      await Promise.all(
+        batch.map(async (dmId) => {
+          try {
+            const result = await this.getThreads(dmId, { pageSize: 3, isDm: true });
+            for (const msg of result.messages) {
+              const senderId = msg.sender_id || msg.sender;
+              if (senderId && senderId !== selfUserId && /^\d+$/.test(senderId)) {
+                dmToUser.set(dmId, senderId);
+                break;
+              }
+            }
+          } catch {
+            // skip DMs we can't resolve
+          }
+        }),
+      );
+    }
+
+    const userIds = Array.from(new Set(dmToUser.values()));
+    const presences: DMPresenceEntry[] = [];
+
+    if (userIds.length > 0) {
+      try {
+        const result = await this.getUserPresenceWithProfile(userIds);
+        for (const [dmId, userId] of dmToUser.entries()) {
+          const presence = result.presences.find((p) => p.userId === userId);
+          if (presence) {
+            presences.push({ ...presence, dmId });
+          }
+        }
+      } catch {
+        // presence fetch failed — return empty
+      }
+    }
+
+    return { presences, total: presences.length };
+  }
+
+  /**
+   * Look up a single DM by its space ID.
+   * Mirrors the API server's `GET /api/dms/:dmId`.
+   */
+  async getDM(dmId: string): Promise<{
+    id: string;
+    name?: string;
+    unreadCount: number;
+    lastMentionTime?: number;
+    unreadReplyCount?: number;
+    notificationCategory?: string;
+  } | null> {
+    const { dms } = await this.listDMs({ limit: 0 });
+    return dms.find((d) => d.id === dmId) ?? null;
+  }
+
+  /**
+   * Mark every unread space / DM as read.
+   * Mirrors the extension bridge's `mark_all_read` command.
+   */
+  async markAllAsRead(): Promise<MarkAllAsReadResult> {
+    const items = await this.listWorldItems();
+    const unread = items.filter((i) => i.unreadCount > 0 || i.unreadReplyCount > 0);
+    let marked = 0;
+    for (const item of unread) {
+      try {
+        await this.markAsRead(item.id);
+        marked++;
+      } catch {
+        // skip individual failures — continue marking the rest
+      }
+    }
+    return { marked, total: unread.length };
+  }
+
+  /**
+   * Resolve an attachment token and download the binary content in one call.
+   * Composes `getAttachmentUrl()` + `proxyFetch()`.
+   * Mirrors the API server's `GET /api/attachment?token=`.
+   */
+  async getAttachmentBinary(attachmentToken: string): Promise<AttachmentBinaryResult> {
+    const signedUrl = await this.getAttachmentUrl(attachmentToken);
+    if (!signedUrl) {
+      throw new Error('Could not resolve attachment URL for the given token');
+    }
+
+    const response = await this.proxyFetch(signedUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch attachment: HTTP ${response.status}`);
+    }
+
+    const contentType = response.headers.get('content-type') || 'application/octet-stream';
+    const buffer = await response.arrayBuffer();
+
+    return { buffer, contentType };
   }
 }

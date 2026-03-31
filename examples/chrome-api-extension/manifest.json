@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Google Chat Notification Manager",
+  "version": "1.0.0",
+  "description": "Manage Google Chat notifications using the official Chat REST API with Chrome OAuth — no server, no tab injection",
+  "permissions": ["identity", "storage", "scripting", "tabs"],
+  "host_permissions": [
+    "https://chat.googleapis.com/*",
+    "https://oauth2.googleapis.com/*",
+    "https://chat.google.com/*",
+    "https://mail.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://mail.google.com/chat/*",
+        "https://chat.google.com/*"
+      ],
+      "js": ["scripts/page.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://mail.google.com/chat/*",
+        "https://chat.google.com/*"
+      ],
+      "js": ["scripts/content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Google Chat Notification Manager"
+  },
+  "icons": {
+    "128": "icons/mouth.svg"
+  }
+}

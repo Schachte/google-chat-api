@@ -1,5 +1,5 @@
-import { Command } from 'commander';
-import { mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
+import { Command, Help } from 'commander';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, openSync } from 'node:fs';
 import * as readline from 'node:readline';
 import { tmpdir } from 'node:os';
 import path, { join } from 'node:path';
@@ -150,17 +150,13 @@ function formatWorldItem(item: WorldItemSummary, showReadStatus = false): string
   const name = item.name || '(unnamed)';
 
   const categoryColors: Record<string, keyof typeof colors> = {
-    direct_mention: 'red',
-    subscribed_thread: 'yellow',
-    subscribed_space: 'blue',
-    direct_message: 'green',
+    badged: 'red',
+    lit_up: 'yellow',
     none: 'dim',
   };
   const categoryLabels: Record<string, string> = {
-    direct_mention: '@mention',
-    subscribed_thread: 'thread',
-    subscribed_space: 'space',
-    direct_message: 'DM',
+    badged: `badge(${item.badgeCount ?? '?'})`,
+    lit_up: 'bold',
     none: '-',
   };
   const category = item.notificationCategory || 'none';
@@ -169,13 +165,16 @@ function formatWorldItem(item: WorldItemSummary, showReadStatus = false): string
   const threadStr = item.subscribedThreadId
     ? c('dim', ` [thread: ${item.subscribedThreadId}]`)
     : '';
+  const threadCountStr = item.threadIds?.length
+    ? c('dim', ` [threads: ${item.threadIds.length}]`)
+    : '';
 
   const isUnread = category !== 'none';
   const readStatusStr = showReadStatus
     ? (isUnread ? c('red', ' ●') : c('dim', ' ○'))
     : '';
 
-  return `  ${c('cyan', item.id)}  ${name}  ${c('dim', `[${item.type}]`)}  ${categoryStr}${threadStr}${readStatusStr}`;
+  return `  ${c('cyan', item.id)}  ${name}  ${c('dim', `[${item.type}]`)}  ${categoryStr}${threadStr}${threadCountStr}${readStatusStr}`;
 }
 
 async function confirmAction(message: string): Promise<boolean> {
@@ -272,18 +271,20 @@ async function cmdNotifications(options: {
     await client.getSelfUser();
   }
 
-  const directMentions = items.filter(item => item.notificationCategory === 'direct_mention');
-  const subscribedThreads = items.filter(item => item.notificationCategory === 'subscribed_thread');
-  const subscribedSpaces = items.filter(item => item.notificationCategory === 'subscribed_space');
-  const directMessages = items.filter(item => item.notificationCategory === 'direct_message');
+  const badgedItems = items.filter(item => item.notificationCategory === 'badged');
+  const litUpItems = items.filter(item => item.notificationCategory === 'lit_up');
+  const threadUnreadSpaces = items.filter(item => item.type === 'space' && item.notificationCategory === 'none' && (item.unreadSubscribedTopicCount > 0 || item.unreadReplyCount > 0));
+  const unreadSpaces = [...litUpItems.filter(item => item.type === 'space'), ...threadUnreadSpaces];
   const readItems = items.filter(item => item.notificationCategory === 'none');
+  const unreadDms = items.filter(item => item.type === 'dm' && item.notificationCategory !== 'none');
+  const badgedSpaces = items.filter(item => item.type === 'space' && item.notificationCategory === 'badged');
 
   const hasCategoryFilter = options.mentions || options.threads || options.spaces || options.dms || options.read || options.me || options.atAll;
   const hasReadFilter = options.read || options.unread;
   const needsMentionCheck = options.me || options.atAll;
 
   const unreads = items.filter(item =>
-    item.notificationCategory !== 'none'
+    item.notificationCategory !== 'none' || threadUnreadSpaces.includes(item)
   );
   const dms = items.filter(item => item.type === 'dm');
 
@@ -297,13 +298,13 @@ async function cmdNotifications(options: {
 
   let itemsToFetch: WorldItemSummary[] = [];
   if (hasCategoryFilter && !needsMentionCheck) {
-    if (options.mentions) itemsToFetch = itemsToFetch.concat(directMentions);
-    if (options.threads) itemsToFetch = itemsToFetch.concat(subscribedThreads);
-    if (options.spaces) itemsToFetch = itemsToFetch.concat(subscribedSpaces);
-    if (options.dms) itemsToFetch = itemsToFetch.concat(directMessages);
+    if (options.mentions) itemsToFetch = itemsToFetch.concat(badgedItems);
+    if (options.threads) itemsToFetch = itemsToFetch.concat(threadUnreadSpaces);
+    if (options.spaces) itemsToFetch = itemsToFetch.concat(unreadSpaces);
+    if (options.dms) itemsToFetch = itemsToFetch.concat(unreadDms);
     if (options.read) itemsToFetch = itemsToFetch.concat(readItems);
   } else if (needsMentionCheck) {
-    itemsToFetch = directMentions;
+    itemsToFetch = badgedItems;
   } else if (options.unread) {
     itemsToFetch = unreads;
   } else {
@@ -373,14 +374,26 @@ async function cmdNotifications(options: {
   }
 
   if (options.json) {
+    const serverBadgeTotal = items.reduce(
+      (sum, i) => sum + (i.badgeCount ?? 0), 0
+    );
     const payload: Record<string, unknown> = {
-      directMentions: options.mentions || !hasCategoryFilter ? directMentions : [],
-      subscribedThreads: options.threads || !hasCategoryFilter ? subscribedThreads : [],
-      subscribedSpaces: options.spaces || !hasCategoryFilter ? subscribedSpaces : [],
-      directMessages: options.dms || !hasCategoryFilter ? directMessages : [],
+      badged: options.mentions || !hasCategoryFilter ? badgedItems : [],
+      unreadSpaces: options.spaces || !hasCategoryFilter ? unreadSpaces : [],
+      threadUnreadSpaces: options.threads || !hasCategoryFilter ? threadUnreadSpaces : [],
+      unreadDms: options.dms || !hasCategoryFilter ? unreadDms : [],
       readItems: options.read || options.all ? readItems : [],
       directMeMentions: options.me ? directMeMentionSpaces : [],
       atAllMentions: options.atAll ? atAllMentionSpaces : [],
+      badges: {
+        totalUnread: unreads.length,
+        badgedCount: badgedItems.length,
+        litUpCount: litUpItems.length,
+        threadUnreadCount: threadUnreadSpaces.length,
+        serverBadgeTotal,
+        directMessages: unreadDms.length,
+        badgedSpaces: badgedSpaces.length,
+      },
       pagination: {
         total: totalBeforePagination,
         offset,
@@ -407,9 +420,9 @@ async function cmdNotifications(options: {
   printHeader('Notifications');
 
   if (needsMentionCheck) {
-    printInfo(`@Me: ${directMeMentionSpaces.length}  @All: ${atAllMentionSpaces.length}  (of ${directMentions.length} mention spaces scanned)`);
+    printInfo(`@Me: ${directMeMentionSpaces.length}  @All: ${atAllMentionSpaces.length}  (of ${badgedItems.length} badged items scanned)`);
   } else {
-    printInfo(`@Mentions: ${directMentions.length}  Threads: ${subscribedThreads.length}  Spaces: ${subscribedSpaces.length}  DMs: ${directMessages.length}  Read: ${readItems.length}`);
+    printInfo(`Badged: ${badgedItems.length}  Unread spaces: ${unreadSpaces.length}  DMs: ${unreadDms.length}  Read: ${readItems.length}`);
   }
 
   const showReadStatus = hasReadFilter || options.all;
@@ -439,16 +452,16 @@ async function cmdNotifications(options: {
     printCategorySection('@ALL MENTIONS (not direct @me)', atAllMentionSpaces);
   }
   if (!hasCategoryFilter || options.mentions) {
-    printCategorySection('DIRECT @MENTIONS', directMentions);
-  }
-  if (!hasCategoryFilter || options.threads) {
-    printCategorySection('SUBSCRIBED THREADS', subscribedThreads);
+    printCategorySection('BADGED (numbered badge)', badgedItems);
   }
   if (!hasCategoryFilter || options.spaces) {
-    printCategorySection('SUBSCRIBED SPACES', subscribedSpaces);
+    printCategorySection('UNREAD SPACES', unreadSpaces);
+  }
+  if (options.threads) {
+    printCategorySection('THREAD UNREAD SPACES', threadUnreadSpaces);
   }
   if (!hasCategoryFilter || options.dms) {
-    printCategorySection('DIRECT MESSAGES', directMessages, 20);
+    printCategorySection('DMs', unreadDms, 20);
   }
   if (options.read) {
     printCategorySection('READ (no activity)', readItems, 50);
@@ -466,11 +479,49 @@ async function cmdNotifications(options: {
 
 async function cmdMessages(
   spaceId: string,
-  options: { refresh?: boolean; json?: boolean; limit?: string; profile?: string }
+  options: { refresh?: boolean; json?: boolean; limit?: string; last?: string; profile?: string }
 ): Promise<void> {
   const client = await createClient();
-  const limit = parseInt(options.limit || '20', 10);
 
+  if (options.last) {
+    const count = parseInt(options.last, 10);
+    if (isNaN(count) || count <= 0) {
+      printError('--last must be a positive number');
+      process.exit(1);
+    }
+
+    // Fetch enough pages to collect the requested number of messages
+    const maxPages = Math.max(Math.ceil(count / 25), 5);
+    const result = await client.getAllMessages(spaceId, {
+      maxPages,
+      pageSize: 25,
+      maxMessages: count,
+    });
+
+    // Sort all messages by timestamp (newest last) and take the last N
+    const sorted = result.messages
+      .filter((msg: Message) => msg.timestamp_usec)
+      .sort((a: Message, b: Message) => (a.timestamp_usec || 0) - (b.timestamp_usec || 0))
+      .slice(-count);
+
+    if (options.json) {
+      console.log(JSON.stringify({ messages: sorted, total: sorted.length }, null, 2));
+      return;
+    }
+
+    printHeader(`Last ${sorted.length} messages from ${spaceId}`);
+
+    for (const msg of sorted) {
+      console.log(formatMessage(msg, '', true));
+    }
+
+    if (result.has_more) {
+      printInfo(`\nMore messages available beyond the fetched window.`);
+    }
+    return;
+  }
+
+  const limit = parseInt(options.limit || '20', 10);
   const result = await client.getThreads(spaceId, { pageSize: limit });
 
   if (options.json) {
@@ -1630,8 +1681,8 @@ program
   .option('-m, --show-messages', 'Fetch and display actual messages for each unread space')
   .option('-n, --messages-limit <num>', 'Number of messages per space (default: 3)', '3')
   .option('--mentions', 'Show only direct @mentions')
-  .option('--threads', 'Show only subscribed threads')
-  .option('--spaces', 'Show only subscribed spaces')
+  .option('--threads', 'Show only thread-unread spaces')
+  .option('--spaces', 'Show only unread spaces')
   .option('--dms', 'Show only direct messages')
   .option('--read', 'Show read items (no unread activity)')
   .option('--unread', 'Show only unread items (default behavior)')
@@ -1654,6 +1705,7 @@ program
   .command('messages <space_id>')
   .description('Get messages from a space')
   .option('-n, --limit <num>', 'Number of messages', '20')
+  .option('--last <num>', 'Fetch the most recent N messages (handles pagination automatically)')
   .action(async (spaceId, opts) => {
     try {
       await cmdMessages(spaceId, { ...program.opts(), ...opts });
@@ -1734,19 +1786,73 @@ program
 
 program
   .command('send <space_id> <message>')
-  .description('Send a new message to a space (creates new thread)')
-  .action(async (spaceId, message) => {
+  .description('Send a message to a space (new thread or reply to existing thread)')
+  .option('-t, --thread <topic_id>', 'Reply to an existing thread instead of creating a new one')
+  .option('-i, --image <path>', 'Attach an image file (png, jpg, gif, webp)')
+  .option('-y, --yes', 'Skip confirmation prompt')
+  .action(async (spaceId, message, opts) => {
     try {
+      const isReply = !!opts.thread;
+      const hasImage = !!opts.image;
+      printInfo(`Space:   ${spaceId}`);
+      if (isReply) {
+        printInfo(`Thread:  ${opts.thread}`);
+      }
+      printInfo(`Message: ${message}`);
+      if (hasImage) {
+        printInfo(`Image:   ${opts.image}`);
+      }
+      if (!opts.yes) {
+        const prompt = isReply ? 'Send this reply?' : 'Send this message?';
+        const confirmed = await confirmAction(prompt);
+        if (!confirmed) {
+          printInfo('Cancelled.');
+          return;
+        }
+      }
       const client = await createClient(program.opts());
-      printInfo(`Sending message to ${spaceId}...`);
-      const result = await client.sendMessage(spaceId, message);
-      if (result.success) {
-        printSuccess(`Message sent!`);
-        printInfo(`  Topic ID: ${result.topic_id}`);
-        printInfo(`  Message ID: ${result.message_id}`);
+      if (isReply && hasImage) {
+        printInfo(`Replying with image to thread ${opts.thread}...`);
+        const result = await client.replyWithImage(spaceId, opts.thread, message, opts.image);
+        if (result.success) {
+          printSuccess(`Reply with image sent!`);
+          printInfo(`  Message ID: ${result.message_id}`);
+        } else {
+          printError(result.error || 'Failed to send reply with image');
+          process.exit(1);
+        }
+      } else if (isReply) {
+        printInfo(`Replying to thread ${opts.thread}...`);
+        const result = await client.replyToThread(spaceId, opts.thread, message);
+        if (result.success) {
+          printSuccess(`Reply sent!`);
+          printInfo(`  Message ID: ${result.message_id}`);
+        } else {
+          printError(result.error || 'Failed to send reply');
+          process.exit(1);
+        }
+      } else if (hasImage) {
+        printInfo(`Sending message with image to ${spaceId}...`);
+        const result = await client.sendMessageWithImage(spaceId, message, opts.image);
+        if (result.success) {
+          printSuccess(`Message with image sent!`);
+          printInfo(`  Topic ID: ${result.topic_id}`);
+          printInfo(`  Message ID: ${result.message_id}`);
+        } else {
+          printError(result.error || 'Failed to send message with image');
+          process.exit(1);
+        }
       } else {
-        printError(result.error || 'Failed to send message');
-        process.exit(1);
+        printInfo(`Sending message to ${spaceId}...`);
+        const result = await client.sendMessage(spaceId, message);
+        if (result.success) {
+          printSuccess(`Message sent!`);
+          printInfo(`  Topic ID: ${result.topic_id}`);
+          printInfo(`  Message ID: ${result.message_id}`);
+        } else {
+          printError(result.error || 'Failed to send message');
+          process.exit(1);
+        }
       }
     } catch (e) {
       printError((e as Error).message);
@@ -1754,11 +1860,23 @@ program
     }
   });
 
+// Hidden alias — keeps `gchat reply` working for backward compatibility
 program
-  .command('reply <space_id> <topic_id> <message>')
-  .description('Reply to an existing thread')
-  .action(async (spaceId, topicId, message) => {
+  .command('reply <space_id> <topic_id> <message>', { hidden: true })
+  .description('(deprecated) Use: send <space_id> <message> --thread <topic_id>')
+  .option('-y, --yes', 'Skip confirmation prompt')
+  .action(async (spaceId, topicId, message, opts) => {
     try {
+      printInfo(`Space:   ${spaceId}`);
+      printInfo(`Thread:  ${topicId}`);
+      printInfo(`Message: ${message}`);
+      if (!opts.yes) {
+        const confirmed = await confirmAction('Send this reply?');
+        if (!confirmed) {
+          printInfo('Cancelled.');
+          return;
+        }
+      }
       const client = await createClient(program.opts());
       printInfo(`Replying to thread ${topicId}...`);
       const result = await client.replyToThread(spaceId, topicId, message);
@@ -1836,7 +1954,7 @@ program
   });
 
 program
-  .command('api')
+  .command('api', { hidden: true })
   .description('Start JSON API server')
   .option('--port <port>', 'Port to listen on', '3000')
   .option('--host <host>', 'Host to bind to', 'localhost')
@@ -1850,7 +1968,139 @@ program
   });
 
 program
-  .command('keepalive')
+  .command('bridge')
+  .description('Start the extension bridge WebSocket server (background by default)')
+  .option('--port <port>', 'Port to listen on (default: GCHAT_EXTENSION_PORT or 7891)')
+  .option('--host <host>', 'Host to bind to (default: GCHAT_EXTENSION_HOST or 0.0.0.0)')
+  .option('--foreground', 'Run in the foreground instead of as a background daemon')
+  .option('--background', 'Run as a background daemon (default)')
+  .action(async (opts) => {
+    try {
+      if (opts.foreground) {
+        // ── Foreground mode ─────────────────────────────────────────────────
+        const { ExtensionBridge, DEFAULT_EXTENSION_PORT, DEFAULT_EXTENSION_HOST } = await import('../core/extension-bridge.js');
+
+        const port = parseInt(opts.port ?? process.env.GCHAT_EXTENSION_PORT ?? String(DEFAULT_EXTENSION_PORT), 10);
+        const host = opts.host ?? process.env.GCHAT_EXTENSION_HOST ?? DEFAULT_EXTENSION_HOST;
+
+        const bridge = new ExtensionBridge(port, host);
+        await bridge.start();
+
+        const display = host === '0.0.0.0' ? 'localhost' : host;
+        printHeader('Extension Bridge Server');
+        console.log(`  Listening on ws://${display}:${port}/`);
+        console.log(`  Waiting for Chrome extension to connect...`);
+        console.log();
+        printInfo('Open chat.google.com with the extension installed.');
+        printInfo('Press Ctrl+C to stop.\n');
+
+        // Graceful shutdown — force-exit if close() hangs
+        let shuttingDown = false;
+        const shutdown = () => {
+          if (shuttingDown) {
+            // Second Ctrl+C — force kill immediately
+            process.exit(1);
+          }
+          shuttingDown = true;
+          console.log('\nShutting down...');
+          // Hard deadline: exit no matter what after 2s
+          const forceTimer = setTimeout(() => process.exit(0), 2000);
+          forceTimer.unref?.();
+          bridge.close().then(() => process.exit(0)).catch(() => process.exit(1));
+        };
+        process.on('SIGINT', shutdown);
+        process.on('SIGTERM', shutdown);
+      } else {
+        // ── Background mode (default) ───────────────────────────────────────
+        const { spawn } = await import('node:child_process');
+        const pidFile = join(tmpdir(), 'gchat-bridge.pid');
+        const logFile = join(tmpdir(), 'gchat-bridge.log');
+
+        // Check if a bridge is already running from a previous invocation
+        if (existsSync(pidFile)) {
+          const existingPid = parseInt(readFileSync(pidFile, 'utf-8').trim(), 10);
+          if (existingPid) {
+            try {
+              process.kill(existingPid, 0);
+              printInfo(`Bridge is already running (PID ${existingPid})`);
+              printInfo(`  PID file: ${pidFile}`);
+              printInfo(`  Log file: ${logFile}`);
+              printInfo(`\nTo stop: kill ${existingPid}`);
+              return;
+            } catch {
+              // Process is dead — stale PID file, continue with new spawn
+            }
+          }
+        }
+
+        // Build child process arguments
+        const childArgs: string[] = [
+          ...process.execArgv,
+          process.argv[1],
+          'bridge', '--foreground',
+        ];
+        if (opts.port) childArgs.push('--port', opts.port);
+        if (opts.host) childArgs.push('--host', opts.host);
+
+        // Forward relevant global flags
+        const globalOpts = program.opts();
+        if (globalOpts.debug) childArgs.push('--debug');
+        if (globalOpts.logLevel && globalOpts.logLevel !== 'info') {
+          childArgs.push('--log-level', globalOpts.logLevel);
+        }
+
+        const outFd = openSync(logFile, 'a');
+        const errFd = openSync(logFile, 'a');
+
+        const child = spawn(process.execPath, childArgs, {
+          detached: true,
+          stdio: ['ignore', outFd, errFd],
+          env: process.env,
+        });
+
+        const pid = child.pid;
+        child.unref();
+
+        if (!pid) {
+          printError('Failed to spawn bridge process');
+          process.exit(1);
+        }
+
+        writeFileSync(pidFile, String(pid));
+
+        // Give the process a moment to start (or crash)
+        await new Promise(r => setTimeout(r, 1500));
+
+        let running = false;
+        try {
+          process.kill(pid, 0);
+          running = true;
+        } catch {
+          running = false;
+        }
+
+        if (running) {
+          printSuccess(`Bridge started (PID ${pid})`);
+          printInfo(`  Status:   running`);
+          printInfo(`  PID file: ${pidFile}`);
+          printInfo(`  Log file: ${logFile}`);
+          printInfo(`\nTo stop: kill ${pid}`);
+        } else {
+          printError(`Bridge failed to start (PID ${pid} exited)`);
+          printInfo(`  Status:   not running`);
+          printInfo(`  Check log: ${logFile}`);
+          try { unlinkSync(pidFile); } catch {}
+          process.exit(1);
+        }
+      }
+    } catch (e) {
+      printError((e as Error).message);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('keepalive', { hidden: true })
   .description('Periodically ping Google Chat to keep session cookies alive (runs 9AM-6PM London time)')
   .option('--interval <minutes>', 'Interval between pings in minutes', '3')
   .option('--dormant-check <minutes>', 'How often to check time when dormant', '20')
@@ -2012,7 +2262,7 @@ program
   });
 
 program
-  .command('stay-online')
+  .command('stay-online', { hidden: true })
   .description('Keep your Google Chat presence as "online" by maintaining a channel connection')
   .option('--ping-interval <seconds>', 'Seconds between activity pings', '60')
   .option('--presence-timeout <seconds>', 'Presence shared timeout in seconds', '120')
@@ -2028,7 +2278,7 @@ program
   });
 
 program
-  .command('presence')
+  .command('presence', { hidden: true })
   .description('Maintain online presence by typing in a channel')
   .option('-c, --channel <id>', 'Space/channel ID to type in (default: AAAAWFu1kqo)', 'AAAAWFu1kqo')
   .option('-r, --refresh-interval <seconds>', 'Seconds between typing bursts (default: 300)', '300')
@@ -2062,6 +2312,203 @@ program
       process.exit(1);
     }
   });
+
+// ── Custom help formatting ──────────────────────────────────────────────────
+
+const COMMAND_CATEGORIES: Array<{ title: string; commands: string[] }> = [
+  { title: 'Reading', commands: ['spaces', 'notifications', 'messages', 'threads', 'thread', 'dms', 'search', 'find-space', 'whoami'] },
+  { title: 'Actions', commands: ['send', 'mark-read', 'export'] },
+  { title: 'Infrastructure', commands: ['bridge'] },
+];
+
+/** Colorize <arg> and [options] tokens inside a string. */
+function colorizeArgs(text: string): string {
+  if (!useColors) return text;
+  return text
+    .replace(/<([^>]+)>/g, `${colors.dim}<$1>${colors.reset}`)
+    .replace(/\[options\]/g, `${colors.dim}[options]${colors.reset}`);
+}
+
+/** Colorize -x and --xxx flag tokens inside an option term. */
+function colorizeFlags(term: string): string {
+  if (!useColors) return term;
+  return term.replace(/(-{1,2}[\w][\w-]*)/g, `${colors.green}$1${colors.reset}`);
+}
+
+/** Strip ANSI escape sequences (for measuring visible width). */
+function stripAnsi(str: string): number {
+  return str.replace(/\x1b\[[0-9;]*m/g, '').length;
+}
+
+/** Pad a string that may contain ANSI escapes to a target *visible* width. */
+function padVisible(str: string, width: number): string {
+  const visible = stripAnsi(str);
+  return visible >= width ? str : str + ' '.repeat(width - visible);
+}
+
+/** Format the root `gchat --help` output with grouped, colored categories. */
+function formatRootHelp(cmd: Command, helper: Help): string {
+  const lines: string[] = [];
+
+  // ── Header ──
+  lines.push('');
+  lines.push(`  ${c('bold', c('cyan', 'gchat'))} ${c('dim', '\u2014 Google Chat CLI')}`);
+  lines.push('');
+  lines.push(`  ${c('bold', 'Usage:')}  ${c('cyan', 'gchat')} ${c('dim', '[command] [options]')}`);
+  lines.push('');
+
+  // ── Build command lookup ──
+  const visibleCmds = helper.visibleCommands(cmd);
+  const cmdMap = new Map<string, Command>();
+  for (const sub of visibleCmds) {
+    cmdMap.set(sub.name(), sub);
+  }
+
+  // ── Compute column width across ALL categories for consistent alignment ──
+  let maxTermLen = 0;
+  for (const cat of COMMAND_CATEGORIES) {
+    for (const name of cat.commands) {
+      const sub = cmdMap.get(name);
+      if (!sub) continue;
+      // Use the raw (un-colored) subcommandTerm for width calculation
+      const rawTerm = helper.subcommandTerm(sub).replace(/\s*\[options\]\s*/, ' ').replace(/\s+/g, ' ').trim();
+      if (rawTerm.length > maxTermLen) maxTermLen = rawTerm.length;
+    }
+  }
+  const colWidth = maxTermLen + 4; // padding between term and description
+
+  // ── Grouped commands ──
+  for (const cat of COMMAND_CATEGORIES) {
+    lines.push(`  ${c('bold', c('yellow', cat.title))}`);
+    for (const name of cat.commands) {
+      const sub = cmdMap.get(name);
+      if (!sub) continue;
+      // Build a clean term: command name + args (drop [options] — it's noise in the overview)
+      const rawTerm = helper.subcommandTerm(sub).replace(/\s*\[options\]\s*/, ' ').replace(/\s+/g, ' ').trim();
+      // Colorize: command name in cyan, args in dim
+      const parts = rawTerm.split(' ');
+      const cmdName = parts[0];
+      const args = parts.slice(1).join(' ');
+      const coloredTerm = `${c('cyan', cmdName)}${args ? ' ' + colorizeArgs(args) : ''}`;
+      const desc = helper.subcommandDescription(sub).split('\n')[0]; // first line only
+      lines.push(`    ${padVisible(coloredTerm, colWidth)}${desc}`);
+    }
+    lines.push('');
+  }
+
+  // ── Global options ──
+  const opts = helper.visibleOptions(cmd);
+  if (opts.length > 0) {
+    lines.push(`  ${c('bold', c('yellow', 'Global Options'))}`);
+    let maxOptLen = 0;
+    const optEntries: Array<{ colored: string; raw: string; desc: string }> = [];
+    for (const opt of opts) {
+      const raw = helper.optionTerm(opt);
+      const colored = colorizeFlags(colorizeArgs(raw));
+      const desc = helper.optionDescription(opt).split('\n')[0];
+      if (raw.length > maxOptLen) maxOptLen = raw.length;
+      optEntries.push({ colored, raw, desc });
+    }
+    const optColWidth = maxOptLen + 4;
+    for (const entry of optEntries) {
+      lines.push(`    ${padVisible(entry.colored, optColWidth)}${entry.desc}`);
+    }
+    lines.push('');
+  }
+
+  // ── Footer ──
+  lines.push(`  ${c('dim', 'Run')} ${c('cyan', 'gchat <command> --help')} ${c('dim', 'for detailed options.')}`);
+  lines.push('');
+
+  return lines.join('\n');
+}
+
+/** Format subcommand --help output with colorized flags and args. */
+function formatSubcommandHelp(cmd: Command, helper: Help): string {
+  const lines: string[] = [];
+
+  // ── Usage ──
+  // Commander's commandUsage includes the full ancestor chain (e.g. "gchat notifications [options]").
+  // Tokenize and colorize each part individually to avoid regex/ANSI conflicts.
+  const rawUsage = helper.commandUsage(cmd);
+  const usageParts = rawUsage.split(' ');
+  const coloredParts = usageParts.map((part, i) => {
+    if (i === 0) return c('cyan', part);                                          // program name
+    if (part.startsWith('<') && part.endsWith('>')) return c('dim', part);         // <arg>
+    if (part.startsWith('[') && part.endsWith(']')) return c('dim', part);         // [options]
+    return c('cyan', part);                                                        // subcommand name
+  });
+  lines.push('');
+  lines.push(`  ${c('bold', 'Usage:')}  ${coloredParts.join(' ')}`);
+  lines.push('');
+
+  // ── Description ──
+  const desc = helper.commandDescription(cmd);
+  if (desc) {
+    lines.push(`  ${desc}`);
+    lines.push('');
+  }
+
+  // ── Arguments ──
+  const args = helper.visibleArguments(cmd);
+  if (args.length > 0) {
+    lines.push(`  ${c('bold', c('yellow', 'Arguments'))}`);
+    let maxArgLen = 0;
+    const argEntries: Array<{ colored: string; raw: string; desc: string }> = [];
+    for (const arg of args) {
+      const raw = helper.argumentTerm(arg);
+      const colored = colorizeArgs(raw);
+      const argDesc = helper.argumentDescription(arg);
+      if (raw.length > maxArgLen) maxArgLen = raw.length;
+      argEntries.push({ colored, raw, desc: argDesc });
+    }
+    const argColWidth = maxArgLen + 4;
+    for (const entry of argEntries) {
+      lines.push(`    ${padVisible(entry.colored, argColWidth)}${entry.desc}`);
+    }
+    lines.push('');
+  }
+
+  // ── Options ──
+  const opts = helper.visibleOptions(cmd);
+  if (opts.length > 0) {
+    lines.push(`  ${c('bold', c('yellow', 'Options'))}`);
+    let maxOptLen = 0;
+    const optEntries: Array<{ colored: string; raw: string; desc: string }> = [];
+    for (const opt of opts) {
+      const raw = helper.optionTerm(opt);
+      const colored = colorizeFlags(colorizeArgs(raw));
+      const optDesc = helper.optionDescription(opt).split('\n')[0];
+      if (raw.length > maxOptLen) maxOptLen = raw.length;
+      optEntries.push({ colored, raw, desc: optDesc });
+    }
+    const optColWidth = maxOptLen + 4;
+    for (const entry of optEntries) {
+      lines.push(`    ${padVisible(entry.colored, optColWidth)}${entry.desc}`);
+    }
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+const helpConfig = {
+  formatHelp(cmd: Command, helper: Help): string {
+    // --help bypasses the preAction hook, so detect --no-color and non-TTY here
+    if (process.argv.includes('--no-color') || !process.stdout.isTTY) {
+      useColors = false;
+    }
+    if (cmd === program) {
+      return formatRootHelp(cmd, helper);
+    }
+    return formatSubcommandHelp(cmd, helper);
+  },
+};
+
+program.configureHelp(helpConfig);
+for (const sub of program.commands) {
+  sub.configureHelp(helpConfig);
+}
 
 export function createProgram(): Command {
   return program;

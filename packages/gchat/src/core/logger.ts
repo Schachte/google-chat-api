@@ -19,7 +19,7 @@ const colors = {
   gray: '\x1b[90m',
 };
 
-let currentLevel: LogLevel = 'info';
+let currentLevel: LogLevel = 'warn';
 let useColors = true;
 
 function initFromEnv(): void {

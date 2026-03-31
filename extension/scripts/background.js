@@ -3,16 +3,18 @@
  *
  * Responsibilities:
  *   1. Maintain a WebSocket connection to the local Node.js bridge server
- *   2. Store the XSRF token relayed from content.js
+ *   2. Store the XSRF token relayed from content.js (persisted to chrome.storage)
  *   3. Proxy API requests from the bridge server through the page context
  *      (so the browser attaches first-party cookies automatically)
  *
  * Protocol (bridge server ↔ extension):
  *   Server → Extension: { type: "hello" }
+ *   Server → Extension: { type: "ping" }          (keepalive — prevents MV3 worker suspension)
  *   Extension → Server: { type: "hello:ack", hasXsrf: bool }
+ *   Extension → Server: { type: "pong" }           (keepalive response)
  *
- *   Server → Extension: { type: "api:request", id: string, url, method, headers, body, bodyType }
- *   Extension → Server: { type: "api:response", id: string, ok, status, body, error? }
+ *   Server → Extension: { type: "api:request", id, url, method, headers, body, bodyType, bodyBytes }
+ *   Extension → Server: { type: "api:response", id, ok, status, headers, body, error? }
  *
  *   Extension → Server: { type: "xsrf:update", token: string }   (whenever token changes)
  *   Extension → Server: { type: "status", connected: true, hasXsrf: bool }
@@ -20,6 +22,7 @@
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
+const DEFAULT_WS_HOST = "localhost";
 const DEFAULT_WS_PORT = 7891;
 const RECONNECT_DELAY_MS = 3000;
 // No hard cap — keep retrying so the extension reconnects whenever the
@@ -32,15 +35,60 @@ let ws = null;
 let xsrfToken = null;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
+let wsHost = DEFAULT_WS_HOST;
 let wsPort = DEFAULT_WS_PORT;
 
 // Pending command responses: id → { resolve, reject, timer }
 const pendingCmds = new Map();
 
+// ─── Host:Port Helpers ───────────────────────────────────────────────────────
+
+/**
+ * Parse a "host:port" string (or just "port", or just "host").
+ * Returns { host, port } with current values as fallbacks.
+ *
+ * Examples:
+ *   "8000"              → { host: <current>, port: 8000 }
+ *   "192.168.1.5:8000"  → { host: "192.168.1.5", port: 8000 }
+ *   "my-server:7891"    → { host: "my-server",   port: 7891 }
+ *   "my-server"         → { host: "my-server",   port: <current> }
+ *   ""                  → { host: <default>,      port: <default> }
+ */
+function parseServerAddress(input) {
+  if (!input || typeof input !== "string") {
+    return { host: wsHost, port: wsPort };
+  }
+  const trimmed = input.trim();
+  if (!trimmed) return { host: DEFAULT_WS_HOST, port: DEFAULT_WS_PORT };
+
+  // Pure number → port only
+  if (/^\d+$/.test(trimmed)) {
+    return { host: wsHost, port: parseInt(trimmed, 10) };
+  }
+
+  // host:port
+  const lastColon = trimmed.lastIndexOf(":");
+  if (lastColon > 0) {
+    const hostPart = trimmed.slice(0, lastColon);
+    const portPart = trimmed.slice(lastColon + 1);
+    const portNum = parseInt(portPart, 10);
+    if (!isNaN(portNum) && portNum > 0 && portNum <= 65535) {
+      return { host: hostPart, port: portNum };
+    }
+  }
+
+  // Just a hostname
+  return { host: trimmed, port: wsPort };
+}
+
+function getServerAddress() {
+  return `${wsHost}:${wsPort}`;
+}
+
 // ─── WebSocket Client ────────────────────────────────────────────────────────
 
 function getWsUrl() {
-  return `ws://localhost:${wsPort}/ws`;
+  return `ws://${wsHost}:${wsPort}/ws`;
 }
 
 function connectWebSocket() {
@@ -48,8 +96,9 @@ function connectWebSocket() {
     return;
   }
 
+  const url = getWsUrl();
   try {
-    ws = new WebSocket(getWsUrl());
+    ws = new WebSocket(url);
   } catch (err) {
     console.error("[GChatBridge] WebSocket creation failed:", err.message);
     scheduleReconnect();
@@ -57,7 +106,7 @@ function connectWebSocket() {
   }
 
   ws.onopen = () => {
-    console.log(`[GChatBridge] Connected to bridge server on port ${wsPort}`);
+    console.log(`[GChatBridge] Connected to bridge server at ${getServerAddress()}`);
     reconnectAttempts = 0;
 
     // Announce ourselves and report current state
@@ -129,6 +178,12 @@ function handleServerMessage(msg) {
       }
       break;
 
+    case "ping":
+      // Application-level keepalive.  Responding executes JS in the
+      // service worker, which resets Chrome's ~30 s idle suspension timer.
+      wsSend({ type: "pong" });
+      break;
+
     case "api:request":
       handleApiRequest(msg);
       break;
@@ -148,9 +203,20 @@ function handleServerMessage(msg) {
     }
 
     case "port:set":
-      // Allow the server to tell the extension which port it's on (future use)
+      // Legacy: allow the server to tell the extension which port it's on
       if (typeof msg.port === "number") {
         wsPort = msg.port;
+        chrome.storage.local.set({ bridgePort: wsPort });
+      }
+      break;
+
+    case "server:set":
+      // Allow the server to tell the extension the full host:port
+      if (typeof msg.address === "string") {
+        const parsed = parseServerAddress(msg.address);
+        wsHost = parsed.host;
+        wsPort = parsed.port;
+        chrome.storage.local.set({ bridgeHost: wsHost, bridgePort: wsPort });
       }
       break;
 
@@ -165,7 +231,11 @@ async function findChatTab() {
   const tabs = await chrome.tabs.query({
     url: ["https://chat.google.com/*", "https://mail.google.com/chat/*"],
   });
-  return tabs[0] || null;
+  if (tabs[0]) return tabs[0];
+
+  // Also check full mail.google.com (Gmail's embedded Chat panel)
+  const gmailTabs = await chrome.tabs.query({ url: "https://mail.google.com/*" });
+  return gmailTabs[0] || null;
 }
 
 async function reinjectContentScripts(tabId) {
@@ -185,13 +255,21 @@ async function reinjectContentScripts(tabId) {
   }
 }
 
-async function proxyApiRequest(url, method, headers, body, bodyType) {
+async function proxyApiRequest(url, method, headers, body, bodyType, bodyBytes) {
   const tab = await findChatTab();
   if (!tab) {
     throw new Error("No Google Chat tab found. Please open chat.google.com first.");
   }
 
-  const message = { type: "API_REQUEST", url, method, headers, body, bodyType };
+  const message = {
+    type: "API_REQUEST",
+    url,
+    method,
+    headers,
+    body,
+    bodyType,
+    bodyBytes: bodyBytes || null,
+  };
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -207,6 +285,7 @@ async function proxyApiRequest(url, method, headers, body, bodyType) {
         err.message?.includes("Extension context invalidated");
 
       if (isDisconnected && attempt === 0) {
+        console.warn("[GChatBridge] Content script unreachable, re-injecting…");
         await reinjectContentScripts(tab.id);
         continue;
       }
@@ -220,15 +299,16 @@ async function proxyApiRequest(url, method, headers, body, bodyType) {
 }
 
 async function handleApiRequest(msg) {
-  const { id, url, method, headers, body, bodyType } = msg;
+  const { id, url, method, headers, body, bodyType, bodyBytes } = msg;
 
   try {
-    const result = await proxyApiRequest(url, method, headers, body, bodyType);
+    const result = await proxyApiRequest(url, method, headers, body, bodyType, bodyBytes);
     wsSend({
       type: "api:response",
       id,
       ok: result.ok,
       status: result.status,
+      headers: result.headers || {},
       body: result.body,
     });
   } catch (err) {
@@ -237,6 +317,8 @@ async function handleApiRequest(msg) {
       id,
       ok: false,
       status: 0,
+      headers: {},
+      body: null,
       error: err.message,
     });
   }
@@ -248,8 +330,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === "XSRF_TOKEN") {
     const isNew = xsrfToken !== request.token;
     xsrfToken = request.token;
+    chrome.storage.local.set({ xsrfToken });
     if (isNew) {
-      console.log("[GChatBridge] XSRF token captured");
+      console.log("[GChatBridge] XSRF token captured from", sender.tab?.url || "unknown tab");
       wsSend({ type: "xsrf:update", token: xsrfToken });
     }
     sendResponse({ ok: true });
@@ -261,7 +344,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       connected: ws && ws.readyState === WebSocket.OPEN,
       hasXsrf: !!xsrfToken,
       reconnectAttempts,
+      host: wsHost,
       port: wsPort,
+      address: getServerAddress(),
     });
     return false;
   }
@@ -275,14 +360,35 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.type === "RECONNECT_WS") {
     reconnectAttempts = 0;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     connectWebSocket();
     sendResponse({ ok: true });
     return false;
   }
 
+  // SET_SERVER — accepts "host:port", "port", or "host"
+  if (request.type === "SET_SERVER") {
+    const parsed = parseServerAddress(request.address);
+    wsHost = parsed.host;
+    wsPort = parsed.port;
+    chrome.storage.local.set({ bridgeHost: wsHost, bridgePort: wsPort });
+    // Reconnect on new address
+    if (ws) {
+      ws.close();
+    }
+    reconnectAttempts = 0;
+    connectWebSocket();
+    sendResponse({ ok: true, host: wsHost, port: wsPort, address: getServerAddress() });
+    return false;
+  }
+
+  // Legacy: SET_PORT (numeric port only)
   if (request.type === "SET_PORT") {
     wsPort = request.port || DEFAULT_WS_PORT;
-    // Reconnect on new port
+    chrome.storage.local.set({ bridgePort: wsPort });
     if (ws) {
       ws.close();
     }
@@ -321,12 +427,30 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ─── Keepalive alarm (prevents MV3 service worker from sleeping) ─────────────
+// Belt-and-suspenders alongside the server's application-level pings.
+
+chrome.alarms.create("keepalive", { periodInMinutes: 0.4 });
+chrome.alarms.onAlarm.addListener(() => {
+  if (ws === null || ws.readyState !== WebSocket.OPEN) {
+    connectWebSocket();
+  } else {
+    wsSend({ type: "ping" });
+  }
+});
+
 // ─── Initialization ──────────────────────────────────────────────────────────
 
-// Load persisted port setting
-chrome.storage.local.get(["bridgePort"]).then((data) => {
+// Load persisted host, port, and XSRF token
+chrome.storage.local.get(["bridgeHost", "bridgePort", "xsrfToken"]).then((data) => {
+  if (data.bridgeHost && typeof data.bridgeHost === "string") {
+    wsHost = data.bridgeHost;
+  }
   if (data.bridgePort && typeof data.bridgePort === "number") {
     wsPort = data.bridgePort;
+  }
+  if (typeof data.xsrfToken === "string") {
+    xsrfToken = data.xsrfToken;
   }
   connectWebSocket();
 }).catch(() => {

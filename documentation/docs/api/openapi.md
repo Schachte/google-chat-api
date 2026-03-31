@@ -309,18 +309,24 @@ Returns presence for DM participants and includes profile fields when available.
 curl "http://localhost:3000/api/dms/presence?dmIds=DM_abc123xyz,DM_def456"
 ```
 
-### Mark as Read
+### Mark as Read or Unread
 
 ```yaml
-POST /api/mark-read/{groupId}
+POST /api/notifications/mark
 ```
 
-Marks a space or DM as read. The body is optional; `unreadCount` is only used when provided.
+Marks a space or DM as read or unread. Requires `groupId` and `action` (`"read"` or `"unread"`) in the JSON body.
 
 ```bash
-curl -X POST "http://localhost:3000/api/mark-read/AAAA_abc123xyz" \
+# Mark as read
+curl -X POST "http://localhost:3000/api/notifications/mark" \
   -H "Content-Type: application/json" \
-  -d '{"unreadCount": 5}'
+  -d '{"groupId": "AAAA_abc123xyz", "action": "read", "unreadCount": 5}'
+
+# Mark as unread
+curl -X POST "http://localhost:3000/api/notifications/mark" \
+  -H "Content-Type: application/json" \
+  -d '{"groupId": "AAAA_abc123xyz", "action": "unread"}'
 ```
 
 ## Pagination

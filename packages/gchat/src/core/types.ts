@@ -347,12 +347,15 @@ export interface SearchOptions {
   sessionId?: string;          
 }
 
+/** Visual notification state matching Google Chat's UI.
+ * - 'badged': numbered badge indicator (space[3][6] > "0")
+ * - 'lit_up': bold text, no number (space[3][27] > space[3][1] AND badge == 0)
+ * - 'none':   clean, no indicator
+ */
 export type NotificationCategory =
-  | 'direct_mention'      
-  | 'subscribed_thread'   
-  | 'subscribed_space'    
-  | 'direct_message'      
-  | 'none';               
+  | 'badged'
+  | 'lit_up'
+  | 'none';
 
 export interface WorldItemSummary {
   id: string;
@@ -364,38 +367,26 @@ export interface WorldItemSummary {
   unreadReplyCount: number;
   lastMessageText?: string;
   subscribedThreadId?: string;       
+  threadIds?: string[];
   isSubscribedToSpace?: boolean;     
   notificationCategory: NotificationCategory;
+
+  /** Server-provided badge count from PBLite readState[6] (getPbliteField 7) */
+  badgeCount?: number;
+  /** Timestamp (usec) of last notification-worthy event from PBLite readState[27] (getPbliteField 28) */
+  lastNotifWorthyEventTimestamp?: number;
+  /** Timestamp (usec) of read watermark from PBLite readState[1] (getPbliteField 2) */
+  readWatermarkTimestamp?: number;
+  /** Notification level: 3 = follows+mentions, 4 = @mentions only (from readState[21]) */
+  notificationLevel?: number;
+  /** Last activity / sort timestamp (usec) extracted from the item's group-ID sub-array.
+   *  Used as a fallback in categorizeNotification when lastNotifWorthyEventTimestamp is absent. */
+  sortTimestamp?: number;
+  /** For DMs: participant user IDs (used internally for name resolution, omitted from API output) */
+  _memberUserIds?: string[];
 }
 
 export type MentionType = 'direct' | 'all' | 'none';
-
-export interface UnreadMention {
-  spaceId: string;
-  spaceName?: string;
-  topicId?: string;
-  messageId?: string;
-  messageText?: string;
-  mentionType: MentionType;
-  mentionedBy?: string;         
-  mentionedByUserId?: string;
-  timestamp?: number;           
-  timestampFormatted?: string;  
-}
-
-export interface UnreadThread {
-  spaceId: string;
-  spaceName?: string;
-  topicId: string;
-  unreadCount: number;
-  lastMessageText?: string;
-  lastMessageSender?: string;
-  lastMessageSenderId?: string;
-  lastMessageTimestamp?: number;
-  lastMessageTimestampFormatted?: string;
-  isSubscribed: boolean;        
-  isParticipant: boolean;       
-}
 
 export interface UnreadSpace {
   spaceId: string;
@@ -408,33 +399,48 @@ export interface UnreadSpace {
   lastMessageText?: string;
   lastMessageSender?: string;
   lastMessageTimestamp?: number;
+  subscribedThreadId?: string;
+  threadIds?: string[];
   isSubscribed: boolean;
   hasMention: boolean;          
-  hasDirect: boolean;           
+  hasDirect: boolean;
+  /** Server-provided badge count (number shown in badge UI) */
+  badgeCount?: number;
+  /** Visual notification state: 'badged', 'lit_up', or 'none' */
+  notificationCategory: NotificationCategory;
+  /** True when this item is promoted into unread results because of unread followed-thread activity. */
+  promotedThreadUnread?: boolean;
 }
 
 export interface UnreadBadgeCounts {
+  /** Total number of spaces/DMs with any notification (badged + lit_up) */
   totalUnread: number;
-  mentions: number;
-  directMentions: number;
-  allMentions: number;
-  subscribedThreads: number;
-  subscribedSpaces: number;
+  /** Number of spaces/DMs with a numbered badge */
+  badgedCount: number;
+  /** Number of spaces/DMs that are lit up (bold, no number) */
+  litUpCount: number;
+  /** Number of badged DMs */
   directMessages: number;
+  /** Number of badged spaces */
+  badgedSpaces: number;
+  /** Number of spaces promoted into unread results because of unread thread activity. */
+  threadUnreadCount: number;
+  /** Sum of server-provided badge counts across all world items */
+  serverBadgeTotal: number;
+  /** Most recent notification-worthy event timestamp (usec) across all items */
+  latestNotifWorthyEvent?: number;
 }
 
 export interface UnreadNotifications {
   badges: UnreadBadgeCounts;
-  
-  mentions: UnreadMention[];           
-  directMentions: UnreadMention[];     
-  allMentions: UnreadMention[];        
-  subscribedThreads: UnreadThread[];   
-  subscribedSpaces: UnreadSpace[];     
-  directMessages: UnreadSpace[];       
-  
+
+  /** Non-badged unread spaces, including lit_up and promoted thread-unread spaces. */
+  spaces: UnreadSpace[];
+  /** DMs with badged or lit_up state */
+  directMessages: UnreadSpace[];
+
   allUnreads: WorldItemSummary[];
-  
+
   lastFetched: number;
   selfUserId?: string;
 }
@@ -480,6 +486,103 @@ export interface TopicReadState {
   muted?: boolean;
   isFollowed?: boolean;
 }
+
+// ─── SDK method option / result types ──────────────────────────────────────
+
+export interface NotificationOptions {
+  /** Only include items with a numbered badge (mentions / DM badges). */
+  mentions?: boolean;
+  /** Include spaces promoted because of unread followed-thread activity. */
+  threads?: boolean;
+  /** Include unread spaces (lit_up plus promoted thread-unread spaces). */
+  spaces?: boolean;
+  /** Include DM items. */
+  dms?: boolean;
+  /** Include fully-read items (notificationCategory === 'none'). */
+  read?: boolean;
+  /** Scan messages for direct @me mentions. Implies `showMessages`. */
+  me?: boolean;
+  /** Scan messages for @all mentions. Implies `showMessages`. */
+  atAll?: boolean;
+  /** Restrict to a single space ID. */
+  space?: string;
+  /** Also fetch recent messages for each matched item. */
+  showMessages?: boolean;
+  /** Max items to return (0 = all). */
+  limit?: number;
+  /** Offset for pagination. */
+  offset?: number;
+  /** Concurrency for parallel message fetching. Default 5. */
+  parallel?: number;
+  /** Number of recent messages to fetch per item. Default 3. */
+  messagesLimit?: number;
+}
+
+export interface NotificationBadges {
+  totalUnread: number;
+  badgedCount: number;
+  litUpCount: number;
+  unreadDMCount: number;
+  threadUnreadCount: number;
+  serverBadgeTotal: number;
+}
+
+export interface NotificationPagination {
+  total: number;
+  offset: number;
+  limit: number;
+  returned: number;
+  hasMore: boolean;
+}
+
+export interface NotificationResult {
+  unreadDMs: WorldItemSummary[];
+  badgedSpaces: WorldItemSummary[];
+  unreadSpaces: WorldItemSummary[];
+  directMeMentions: WorldItemSummary[];
+  atAllMentions: WorldItemSummary[];
+  badges: NotificationBadges;
+  messages?: Record<string, Message[]>;
+  mentionsShortcutId?: string;
+  pagination: NotificationPagination;
+}
+
+export interface RefreshUnreadsSummary {
+  totalUnread: number;
+  badgedCount: number;
+  litUpCount: number;
+  threadUnreadCount: number;
+  serverBadgeTotal: number;
+  directMessages: number;
+  badgedSpaces: number;
+}
+
+export interface RefreshUnreadsResult {
+  unreads: WorldItemSummary[];
+  total: number;
+  summary: RefreshUnreadsSummary;
+}
+
+export interface MarkAllAsReadResult {
+  marked: number;
+  total: number;
+}
+
+export interface AttachmentBinaryResult {
+  buffer: ArrayBuffer;
+  contentType: string;
+}
+
+export interface DMPresenceEntry extends UserPresenceWithProfile {
+  dmId: string;
+}
+
+export interface DMPresenceResult {
+  presences: DMPresenceEntry[];
+  total: number;
+}
+
+// ─── Wire-format types ─────────────────────────────────────────────────────
 
 export interface AuthTokens {
   access_token: string;

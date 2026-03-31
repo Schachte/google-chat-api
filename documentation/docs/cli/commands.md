@@ -176,12 +176,18 @@ gchat messages <space_id> [options]
 
 | Option | Description |
 |--------|-------------|
-| `--limit <n>` | Number of messages to fetch (default: 20) |
+| `-n, --limit <n>` | Number of messages to fetch (default: 20) |
+| `--last <n>` | Fetch the most recent N messages (handles pagination automatically) |
 | `--json` | Output as JSON |
 
-**Example:**
+**Examples:**
+
 ```bash
+# Get messages (default page)
 gchat messages AAAA_abc123 --limit 50
+
+# Get the 10 most recent messages (auto-paginates)
+gchat messages AAAA_abc123 --last 10
 ```
 
 ---
@@ -357,7 +363,7 @@ gchat find-space "project"
 
 ## send
 
-Send a new message (creates a new thread).
+Send a message to a space. Creates a new thread by default, or replies to an existing thread with `--thread`.
 
 ```bash
 gchat send <space_id> <message> [options]
@@ -374,40 +380,20 @@ gchat send <space_id> <message> [options]
 
 | Option | Description |
 |--------|-------------|
-| `--json` | Output result as JSON |
+| `-t, --thread <topic_id>` | Reply to an existing thread instead of creating a new one |
+| `-y, --yes` | Skip confirmation prompt |
 
-**Example:**
+**Examples:**
+
 ```bash
+# Send a new message (creates a new thread)
 gchat send AAAA_abc123 "Hello team! Here's the update."
-```
 
----
+# Reply to an existing thread
+gchat send AAAA_abc123 "Thanks for the info!" --thread topic_xyz789
 
-## reply
-
-Reply to an existing thread.
-
-```bash
-gchat reply <space_id> <topic_id> <message> [options]
-```
-
-**Arguments:**
-
-| Argument | Description |
-|----------|-------------|
-| `space_id` | The space ID |
-| `topic_id` | The topic/thread ID to reply to |
-| `message` | The reply message text |
-
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `--json` | Output result as JSON |
-
-**Example:**
-```bash
-gchat reply AAAA_abc123 topic_xyz789 "Thanks for the info!"
+# Skip confirmation
+gchat send AAAA_abc123 "Quick note" -y
 ```
 
 ---
@@ -486,7 +472,7 @@ gchat api --port 8080 --host 0.0.0.0
 | `GET /api/notifications` | Notification feed |
 | `GET /api/unreads` | Categorized unreads |
 | `GET /api/unreads/refresh` | Refresh unread counts |
-| `POST /api/mark-read/:groupId` | Mark space/DM as read |
+| `POST /api/notifications/mark` | Mark space/DM as read or unread |
 | `GET /api/dms` | List DMs |
 | `GET /api/dms/presence` | DM presence lookup |
 | `GET /api/dms/:dmId/threads` | DM threads (alias `/topics`) |

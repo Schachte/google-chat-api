@@ -627,7 +627,7 @@ export async function generatePeopleApiAuthHeader(
 export async function authenticateWithExtension(options: {
   tokenTimeoutMs?: number;
 } = {}): Promise<AuthResult> {
-  const { tokenTimeoutMs = 30_000 } = options;
+  const { tokenTimeoutMs = 60_000 } = options;
 
   // Dynamic import to avoid pulling ws into builds that don't need it
   const { getExtensionBridge } = await import('./extension-bridge.js');

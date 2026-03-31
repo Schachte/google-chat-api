@@ -8,7 +8,7 @@ import { createClient, type CreateClientOptions } from '../app/client.js';
 import { GoogleChatChannel, type ChannelEvent, type Conversation } from '../core/channel.js';
 import type { GoogleChatClient } from '../core/client.js';
 import { log } from '../core/logger.js';
-import type { Message, WorldItemSummary, UserPresenceWithProfile } from '../core/types.js';
+import type { Message, Space, WorldItemSummary, UserPresenceWithProfile } from '../core/types.js';
 import {
   getFavorites,
   addFavorite,
@@ -93,6 +93,52 @@ function loadOpenApiYaml(): string {
   } catch {
     return FALLBACK_OPENAPI_YAML;
   }
+}
+
+// ── Simple TTL cache ────────────────────────────────────────────────
+const DEFAULT_CACHE_TTL = 5_000; // 5 seconds
+
+interface CacheEntry<T> {
+  data: T;
+  expiry: number;
+}
+
+const apiCache = new Map<string, CacheEntry<unknown>>();
+
+function cached<T>(key: string, fn: () => Promise<T>, ttl = DEFAULT_CACHE_TTL): Promise<T> {
+  const now = Date.now();
+  const entry = apiCache.get(key) as CacheEntry<T> | undefined;
+  if (entry && entry.expiry > now) {
+    return Promise.resolve(entry.data);
+  }
+  return fn().then(data => {
+    apiCache.set(key, { data, expiry: now + ttl });
+    return data;
+  });
+}
+
+// ── Sliding-window concurrency limiter ─────────────────────────────
+async function mapConcurrent<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let next = 0;
+
+  async function worker(): Promise<void> {
+    while (next < items.length) {
+      const idx = next++;
+      try {
+        results[idx] = { status: 'fulfilled', value: await fn(items[idx]) };
+      } catch (reason) {
+        results[idx] = { status: 'rejected', reason };
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
+  return results;
 }
 
 function sendJson(res: ServerResponse, status: number, data: unknown): void {
@@ -425,7 +471,7 @@ export async function startApiServer(options: StartApiServerOptions = {}): Promi
             { method: 'POST', path: '/api/spaces/:spaceId/messages', description: 'Send message' },
             { method: 'GET', path: '/api/dms/:dmId/messages', description: 'Get DM messages' },
             { method: 'GET', path: '/api/notifications', description: 'Get notifications' },
-            { method: 'POST', path: '/api/mark-read/:groupId', description: 'Mark space/DM as read' },
+            { method: 'POST', path: '/api/notifications/mark', description: 'Mark space/DM as read or unread' },
             { method: 'GET', path: '/api/presence', description: 'Presence lookup' },
             { method: 'GET', path: '/api/favorites', description: 'List favorites' },
             { method: 'POST', path: '/api/favorites/:id', description: 'Add to favorites' },
@@ -451,22 +497,46 @@ export async function startApiServer(options: StartApiServerOptions = {}): Promi
         const pageSize = query.pageSize ? parseInt(query.pageSize, 10) : 200;
         const cursor = query.cursor ? parseInt(query.cursor, 10) : undefined;
         const paginateMode = query.paginate === 'true' || cursor !== undefined;
-        const enrich = query.enrich !== 'false';  
+        const enrich = query.enrich !== 'false';
+        const typeFilter = query.type as string | undefined; // 'spaces', 'dms', or omitted
+
+        let allItems: Space[];
+        let pagination: unknown;
 
         if (paginateMode) {
           const result = await client.listSpacesPaginated({ pageSize, cursor, enrich });
-          return sendJson(res, 200, {
-            spaces: result.spaces,
-            count: result.spaces.length,
-            pagination: result.pagination,
-          });
+          allItems = result.spaces;
+          pagination = result.pagination;
         } else {
-          const spaces = await client.listSpacesEnriched({ pageSize, enrich });
+          allItems = await client.listSpacesEnriched({ pageSize, enrich });
+        }
+
+        const spaceItems = allItems.filter(s => s.type === 'space');
+        const dmItems = allItems.filter(s => s.type === 'dm');
+
+        if (typeFilter === 'spaces') {
           return sendJson(res, 200, {
-            spaces,
-            count: spaces.length,
+            spaces: spaceItems,
+            count: spaceItems.length,
+            ...(pagination ? { pagination } : {}),
           });
         }
+        if (typeFilter === 'dms') {
+          return sendJson(res, 200, {
+            dms: dmItems,
+            count: dmItems.length,
+            ...(pagination ? { pagination } : {}),
+          });
+        }
+
+        return sendJson(res, 200, {
+          spaces: spaceItems,
+          dms: dmItems,
+          spacesCount: spaceItems.length,
+          dmsCount: dmItems.length,
+          count: allItems.length,
+          ...(pagination ? { pagination } : {}),
+        });
       }
 
       if (path === '/api/whoami') {
@@ -593,9 +663,9 @@ export async function startApiServer(options: StartApiServerOptions = {}): Promi
         const spaceId = decodeURIComponent(threadMatch[1]);
         const topicId = decodeURIComponent(threadMatch[2]);
         const pageSize = parseInt(query.pageSize || '100', 10);
-        console.log('[API] Getting single thread:', { spaceId, topicId, pageSize });
+        log.api.debug('Getting single thread:', { spaceId, topicId, pageSize });
         const result = await client.getThread(spaceId, topicId, pageSize);
-        console.log('[API] Thread result:', { messages: result.messages?.length, total: result.total_messages });
+        log.api.debug('Thread result:', { messages: result.messages?.length, total: result.total_messages });
         return sendJson(res, 200, result);
       }
 
@@ -631,11 +701,25 @@ export async function startApiServer(options: StartApiServerOptions = {}): Promi
         const messagesLimitParam = parseInt(query.messagesLimit as string || query['messages-limit'] as string || '3', 10);
         const showMessages = query.messages === 'true' || filterMe || filterAtAll;
 
-        let { items } = await client.fetchWorldItems();
+        // Fire independent network calls in parallel, each behind a 5 s cache
+        const [worldResult, mentionsSpaces] = await Promise.all([
+          cached('worldItems', () => client.fetchWorldItems()),
+          (filterMe && !filterSpace)
+            ? cached('findMentions', () => client.findSpaces('mentions'))
+            : undefined,
+          (filterMe || filterAtAll)
+            ? cached('selfUser', () => client.getSelfUser())
+            : undefined,
+        ]);
+
+        let { items } = worldResult;
+
+        // Always exclude the synthetic Shortcut-MENTIONS space — it cannot
+        // be marked as read and is never a real unread notification.
+        items = items.filter(i => i.name !== 'Shortcut-MENTIONS');
 
         let mentionsShortcutId: string | undefined;
-        if (filterMe && !filterSpace) {
-          const mentionsSpaces = await client.findSpaces('mentions');
+        if (mentionsSpaces) {
           const mentionsShortcut = mentionsSpaces.find(s =>
             s.name?.toLowerCase().includes('mentions') ||
             s.name?.toLowerCase() === 'mentions-shortcut'
@@ -650,32 +734,71 @@ export async function startApiServer(options: StartApiServerOptions = {}): Promi
           items = items.filter(i => i.id === filterSpace);
         }
 
-        if (filterMe || filterAtAll) {
-          await client.getSelfUser();
+        // Strip internal/deprecated fields and add human-readable timestamps
+        const tz = process.env.GCHAT_TIMEZONE || 'UTC';
+        const fmtTs = (usec: number | undefined): string | undefined => {
+          if (!usec) return undefined;
+          const d = new Date(usec / 1000); // µs → ms
+          return d.toLocaleString('en-US', {
+            timeZone: tz,
+            month: 'long', day: 'numeric', year: 'numeric',
+            hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+          });
+        };
+        const sanitize = ({ unreadCount, unreadSubscribedTopicCount, unreadReplyCount, notificationLevel, _memberUserIds, ...rest }: WorldItemSummary) => ({
+          ...rest,
+          ...(rest.lastNotifWorthyEventTimestamp != null && { lastNotifWorthyEvent: fmtTs(rest.lastNotifWorthyEventTimestamp) }),
+          ...(rest.readWatermarkTimestamp != null && { readWatermark: fmtTs(rest.readWatermarkTimestamp) }),
+        });
+
+        // ── Single-pass categorization ─────────────────────────────
+        const unreadDMs: WorldItemSummary[] = [];
+        const badgedSpaces: WorldItemSummary[] = [];
+        const litupSpaces: WorldItemSummary[] = [];
+        const threadUnreadSpaces: WorldItemSummary[] = [];
+        const readItems: WorldItemSummary[] = [];
+        let serverBadgeTotal = 0;
+
+        for (const i of items) {
+          serverBadgeTotal += i.badgeCount ?? 0;
+          const cat = i.notificationCategory;
+          if (i.type === 'dm') {
+            if (cat === 'badged' || cat === 'lit_up') unreadDMs.push(i);
+            else readItems.push(i);
+          } else {
+            if (cat === 'badged') badgedSpaces.push(i);
+            else if (cat === 'lit_up') litupSpaces.push(i);
+            else if (i.unreadSubscribedTopicCount > 0 || i.unreadReplyCount > 0) threadUnreadSpaces.push(i);
+            else readItems.push(i);
+          }
         }
 
-        const directMentions = items.filter(i => i.notificationCategory === 'direct_mention');
-        const subscribedThreads = items.filter(i => i.notificationCategory === 'subscribed_thread');
-        const subscribedSpaces = items.filter(i => i.notificationCategory === 'subscribed_space');
-        const directMessages = items.filter(i => i.notificationCategory === 'direct_message');
-        const readItems = items.filter(i => i.notificationCategory === 'none');
-        const unreads = items.filter(i => i.notificationCategory !== 'none');
-        const dms = items.filter(i => i.type === 'dm');
+        const allUnreadSpaces = [...litupSpaces, ...threadUnreadSpaces];
+        const subscribedSpaces = allUnreadSpaces.filter(i => i.isSubscribedToSpace);
+        const unreadSpaces = allUnreadSpaces.filter(i => !i.isSubscribedToSpace);
 
         const hasFilter = filterMentions || filterThreads || filterSpaces || filterDms || filterRead || filterMe || filterAtAll;
         let itemsToProcess: WorldItemSummary[] = [];
 
         if (hasFilter && !filterMe && !filterAtAll) {
-          if (filterMentions) itemsToProcess = itemsToProcess.concat(directMentions);
-          if (filterThreads) itemsToProcess = itemsToProcess.concat(subscribedThreads);
-          if (filterSpaces) itemsToProcess = itemsToProcess.concat(subscribedSpaces);
-          if (filterDms) itemsToProcess = itemsToProcess.concat(directMessages);
+          if (filterMentions) itemsToProcess = itemsToProcess.concat(unreadDMs, badgedSpaces);
+          if (filterThreads) itemsToProcess = itemsToProcess.concat(threadUnreadSpaces);
+          if (filterSpaces) itemsToProcess = itemsToProcess.concat(unreadSpaces);
+          if (filterDms) itemsToProcess = itemsToProcess.concat(unreadDMs);
           if (filterRead) itemsToProcess = itemsToProcess.concat(readItems);
         } else if (filterMe || filterAtAll) {
-          itemsToProcess = directMentions;
+          itemsToProcess = [...unreadDMs, ...badgedSpaces];
         } else {
-          itemsToProcess = unreads;
+          itemsToProcess = [...unreadDMs, ...badgedSpaces, ...unreadSpaces];
         }
+
+        // De-duplicate in case multiple filters overlap
+        const seen = new Set<string>();
+        itemsToProcess = itemsToProcess.filter(i => {
+          if (seen.has(i.id)) return false;
+          seen.add(i.id);
+          return true;
+        });
 
         const totalItems = itemsToProcess.length;
         if (offsetParam > 0) {
@@ -689,32 +812,28 @@ export async function startApiServer(options: StartApiServerOptions = {}): Promi
         const atAllMentions: WorldItemSummary[] = [];
         const messages: Record<string, Message[]> = {};
 
+        // ── Sliding-window message fetch ───────────────────────────
         if (showMessages && itemsToProcess.length > 0) {
-          for (let i = 0; i < itemsToProcess.length; i += parallelParam) {
-            const batch = itemsToProcess.slice(i, i + parallelParam);
-            const results = await Promise.allSettled(
-              batch.map(async (item) => {
-                const result = await client.getThreads(item.id, { pageSize: messagesLimitParam });
-                return { item, result };
-              })
-            );
+          const results = await mapConcurrent(itemsToProcess, parallelParam, async (item) => {
+            const result = await client.getThreads(item.id, { pageSize: messagesLimitParam });
+            return { item, result };
+          });
 
-            for (const settledResult of results) {
-              if (settledResult.status === 'fulfilled') {
-                const { item, result } = settledResult.value;
-                if (result.messages.length > 0) {
-                  messages[item.id] = result.messages;
+          for (const settledResult of results) {
+            if (settledResult.status === 'fulfilled') {
+              const { item, result } = settledResult.value;
+              if (result.messages.length > 0) {
+                messages[item.id] = result.messages;
 
-                  if (filterMe || filterAtAll) {
-                    let hasDirectMe = false;
-                    let hasAtAll = false;
-                    for (const msg of result.messages) {
-                      if (client.isDirectlyMentioned(msg)) hasDirectMe = true;
-                      if (client.hasAllMention(msg)) hasAtAll = true;
-                    }
-                    if (hasDirectMe) directMeMentions.push(item);
-                    if (hasAtAll && !hasDirectMe) atAllMentions.push(item);
+                if (filterMe || filterAtAll) {
+                  let hasDirectMe = false;
+                  let hasAtAll = false;
+                  for (const msg of result.messages) {
+                    if (client.isDirectlyMentioned(msg)) hasDirectMe = true;
+                    if (client.hasAllMention(msg)) hasAtAll = true;
                   }
+                  if (hasDirectMe) directMeMentions.push(item);
+                  if (hasAtAll && !hasDirectMe) atAllMentions.push(item);
                 }
               }
             }
@@ -722,15 +841,21 @@ export async function startApiServer(options: StartApiServerOptions = {}): Promi
         }
 
         return sendJson(res, 200, {
-          directMentions: filterMentions || !hasFilter ? directMentions : [],
-          subscribedThreads: filterThreads || !hasFilter ? subscribedThreads : [],
-          subscribedSpaces: filterSpaces || !hasFilter ? subscribedSpaces : [],
-          directMessages: filterDms || !hasFilter ? directMessages : [],
-          readItems: filterRead ? readItems : [],
-          directMeMentions: filterMe ? directMeMentions : [],
-          atAllMentions: filterAtAll ? atAllMentions : [],
-          unreads,
-          dms,
+          unreadDMs: unreadDMs.map(sanitize),
+          badgedSpaces: badgedSpaces.map(sanitize),
+          subscribedSpaces: subscribedSpaces.map(sanitize),
+          unreadSpaces: unreadSpaces.map(sanitize),
+          directMeMentions: filterMe ? directMeMentions.map(sanitize) : [],
+          atAllMentions: filterAtAll ? atAllMentions.map(sanitize) : [],
+          badges: {
+            totalUnread: unreadDMs.length + badgedSpaces.length + allUnreadSpaces.length,
+            badgedCount: badgedSpaces.length,
+            litUpCount: litupSpaces.length,
+            unreadDMCount: unreadDMs.length,
+            subscribedCount: subscribedSpaces.length,
+            threadUnreadCount: threadUnreadSpaces.length,
+            serverBadgeTotal,
+          },
           messages: showMessages ? messages : undefined,
           mentionsShortcutId: mentionsShortcutId || undefined,
           pagination: {
@@ -744,17 +869,9 @@ export async function startApiServer(options: StartApiServerOptions = {}): Promi
       }
 
       if (path === '/api/unreads') {
-        const fetchMessages = query.fetchMessages !== 'false';
-        const messagesPerSpace = parseInt(query.messagesPerSpace as string || query['messages-per-space'] as string || '5', 10);
-        const checkParticipation = query.checkParticipation === 'true' || query['check-participation'] === 'true';
-        const parallel = parseInt(query.parallel as string || '5', 10);
         const forceRefresh = query.refresh === 'true';
 
         const unreads = await client.getUnreadNotifications({
-          fetchMessages,
-          messagesPerSpace,
-          checkParticipation,
-          parallel,
           forceRefresh,
         });
 
@@ -762,51 +879,37 @@ export async function startApiServer(options: StartApiServerOptions = {}): Promi
           badges: unreads.badges,
 
           sections: {
-            unreads: unreads.subscribedSpaces.filter(s => s.type === 'space'),
+            badgedSpaces: unreads.spaces
+              .filter(s => s.notificationCategory === 'badged')
+              .map(s => ({
+                id: s.spaceId,
+                name: s.spaceName,
+                type: s.type,
+                badgeCount: s.badgeCount,
+                notificationCategory: s.notificationCategory,
+              })),
 
-            mentions: unreads.mentions.map(m => ({
-              id: m.spaceId,
-              name: m.spaceName,
-              type: 'mention',
-              mentionType: m.mentionType,
-              messageText: m.messageText?.slice(0, 100),
-              mentionedBy: m.mentionedBy,
-              timestamp: m.timestamp,
-            })),
-
-            directMentions: unreads.directMentions.map(m => ({
-              id: m.spaceId,
-              name: m.spaceName,
-              type: 'direct_mention',
-              messageText: m.messageText?.slice(0, 100),
-              mentionedBy: m.mentionedBy,
-              timestamp: m.timestamp,
-            })),
-
-            threads: unreads.subscribedThreads.map(t => ({
-              id: t.spaceId,
-              name: t.spaceName,
-              type: 'thread',
-              topicId: t.topicId,
-              unreadCount: t.unreadCount,
-              lastMessageText: t.lastMessageText?.slice(0, 100),
-              isSubscribed: t.isSubscribed,
-              isParticipant: t.isParticipant,
-            })),
+            unreadSpaces: unreads.spaces
+              .filter(s => s.notificationCategory !== 'badged')
+              .map(s => ({
+                id: s.spaceId,
+                name: s.spaceName,
+                type: s.type,
+                notificationCategory: s.notificationCategory,
+                promotedThreadUnread: s.promotedThreadUnread,
+              })),
 
             directMessages: unreads.directMessages.map(d => ({
               id: d.spaceId,
               name: d.spaceName,
               type: 'dm',
-              unreadCount: d.unreadCount,
+              badgeCount: d.badgeCount,
+              notificationCategory: d.notificationCategory,
             })),
           },
 
           raw: {
-            mentions: unreads.mentions,
-            directMentions: unreads.directMentions,
-            subscribedThreads: unreads.subscribedThreads,
-            subscribedSpaces: unreads.subscribedSpaces,
+            spaces: unreads.spaces,
             directMessages: unreads.directMessages,
           },
 
@@ -816,38 +919,85 @@ export async function startApiServer(options: StartApiServerOptions = {}): Promi
 
       if (path === '/api/unreads/refresh') {
         const { items } = await client.fetchWorldItems({ forceRefresh: true });
-        const unreads = items.filter(i => i.unreadCount > 0 || i.unreadReplyCount > 0);
+        const badged = items.filter(i => i.notificationCategory === 'badged');
+        const litUp = items.filter(i => i.notificationCategory === 'lit_up');
+        const threadUnreadSpaces = items.filter(i => i.type === 'space' && i.notificationCategory === 'none' && (i.unreadSubscribedTopicCount > 0 || i.unreadReplyCount > 0));
+        const unreads = items.filter(i => i.notificationCategory !== 'none' || threadUnreadSpaces.includes(i));
 
-        const dmUnreads = unreads.filter(i => i.type === 'dm');
-        const spaceUnreads = unreads.filter(i => i.type === 'space');
+        const serverBadgeTotal = items.reduce(
+          (sum, i) => sum + (i.badgeCount ?? 0), 0
+        );
 
         return sendJson(res, 200, {
           unreads,
           total: unreads.length,
           summary: {
             totalUnread: unreads.length,
-            directMessages: dmUnreads.length,
-            spaces: spaceUnreads.length,
-            dmUnreadCount: dmUnreads.reduce((sum, d) => sum + d.unreadCount, 0),
-            spaceUnreadCount: spaceUnreads.reduce((sum, s) => sum + s.unreadCount, 0),
+            badgedCount: badged.length,
+            litUpCount: litUp.length,
+            threadUnreadCount: threadUnreadSpaces.length,
+            serverBadgeTotal,
+            directMessages: unreads.filter(i => i.type === 'dm').length,
+            badgedSpaces: badged.filter(i => i.type === 'space').length,
           },
         });
       }
 
-      const markReadMatch = path.match(/^\/api\/mark-read\/([^/]+)$/);
-      if (markReadMatch && req.method === 'POST') {
-        const groupId = decodeURIComponent(markReadMatch[1]);
+      if (path === '/api/notifications/mark' && req.method === 'POST') {
         let body: Record<string, unknown> = {};
         try {
           body = await readJsonBody(req);
         } catch {
+          return sendJson(res, 400, { success: false, error: 'Invalid JSON body' });
         }
-        const unreadCount = typeof body.unreadCount === 'number' ? body.unreadCount : undefined;
 
-        console.log(`[API] Marking ${groupId} as read (unreadCount: ${unreadCount})`);
-        const result = await client.markAsRead(groupId, unreadCount);
-        console.log(`[API] markAsRead result:`, JSON.stringify(result));
-        return sendJson(res, result.success ? 200 : 500, result);
+        const groupId = typeof body.groupId === 'string' ? body.groupId.trim() : '';
+        const action = typeof body.action === 'string' ? body.action.trim() : '';
+        const topicId = typeof body.topicId === 'string' ? body.topicId.trim() : '';
+
+        if (!groupId) {
+          return sendJson(res, 400, { success: false, error: 'Missing required field: groupId' });
+        }
+        if (action !== 'read' && action !== 'unread') {
+          return sendJson(res, 400, { success: false, error: 'Field "action" must be "read" or "unread"' });
+        }
+
+        // NOTE: Shortcut-MENTIONS is already filtered out of the
+        // /api/notifications response (line ~719), so it should never
+        // reach this endpoint from the extension.  If it somehow does,
+        // the underlying Google Chat API will return 500 and the
+        // generic error path below will handle it gracefully.
+
+        let markResult;
+        if (topicId) {
+          const timestamp = typeof body.timestamp === 'number' ? body.timestamp : undefined;
+          if (action === 'read') {
+            log.api.debug(`Marking thread ${groupId}/${topicId} as read (timestamp: ${timestamp ?? 'auto'})`);
+            markResult = await client.markThreadAsRead(groupId, topicId, timestamp);
+            log.api.debug('markThreadAsRead result:', JSON.stringify(markResult));
+          } else {
+            log.api.debug(`Marking thread ${groupId}/${topicId} as unread (timestamp: ${timestamp ?? 0})`);
+            markResult = await client.markThreadAsUnread(groupId, topicId, timestamp);
+            log.api.debug('markThreadAsUnread result:', JSON.stringify(markResult));
+          }
+        } else if (action === 'read') {
+          const unreadCount = typeof body.unreadCount === 'number' ? body.unreadCount : undefined;
+          log.api.debug(`Marking ${groupId} as read (unreadCount: ${unreadCount})`);
+          markResult = await client.markAsRead(groupId, unreadCount);
+          log.api.debug('markAsRead result:', JSON.stringify(markResult));
+        } else {
+          const timestamp = typeof body.timestamp === 'number' ? body.timestamp : undefined;
+          log.api.debug(`Marking ${groupId} as unread (timestamp: ${timestamp ?? 0})`);
+          markResult = await client.markAsUnread(groupId, timestamp);
+          log.api.debug('markAsUnread result:', JSON.stringify(markResult));
+        }
+
+        // Invalidate cached world items so the next notifications fetch is fresh
+        if (markResult.success) {
+          apiCache.delete('worldItems');
+        }
+
+        return sendJson(res, markResult.success ? 200 : 500, markResult);
       }
 
       if (path === '/api/search' && query.q) {
@@ -1292,4 +1442,3 @@ export async function startApiServer(options: StartApiServerOptions = {}): Promi
 
   startServer();
 }
-
